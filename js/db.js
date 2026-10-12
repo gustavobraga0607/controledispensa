@@ -1,8 +1,8 @@
 // Persistência local com IndexedDB. Tudo fica no aparelho, funciona offline.
 
 const DB_NAME = 'controle-dispensa';
-const DB_VERSION = 1;
-const STORES = ['groups', 'products', 'movements', 'meta'];
+const DB_VERSION = 2;
+const STORES = ['groups', 'products', 'movements', 'meta', 'users'];
 
 let dbPromise = null;
 
@@ -24,6 +24,7 @@ function open() {
         s.createIndex('productId', 'productId', { unique: false });
       }
       if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'key' });
+      if (!db.objectStoreNames.contains('users')) db.createObjectStore('users', { keyPath: 'id' });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -41,6 +42,15 @@ function wrap(req) {
 async function store(name, mode = 'readonly') {
   const db = await open();
   return db.transaction(name, mode).objectStore(name);
+}
+
+// Usuário que está usando o app agora: carimbado em toda movimentação e registro do log.
+let actor = null;
+export function setActor(user) {
+  actor = user ? { userId: user.id, userName: user.name, userIcon: user.icon || '' } : null;
+}
+function stamp() {
+  return actor || { userId: null, userName: '', userIcon: '' };
 }
 
 export function uid() {
@@ -99,6 +109,7 @@ export async function move(productId, type, qty = 1) {
     type,
     qty,
     at: Date.now(),
+    ...stamp(),
   };
   tx.objectStore('movements').put(movement);
   await new Promise((resolve, reject) => {
@@ -106,6 +117,12 @@ export async function move(productId, type, qty = 1) {
     tx.onerror = () => reject(tx.error);
   });
   return { product, movement };
+}
+
+// Registra no log uma ação que não mexe no estoque (cadastro, edição, exclusão…).
+// Fica na mesma tabela das movimentações com type 'log', ignorada pelos relatórios de consumo.
+export async function log(action, text, extra = {}) {
+  return put('movements', { id: uid(), type: 'log', action, text, qty: 0, at: Date.now(), ...stamp(), ...extra });
 }
 
 // Desfaz um movimento (ex.: bipou o produto errado).
@@ -123,6 +140,16 @@ export async function undo(movementId) {
     products.put(product);
   }
   movements.delete(movementId);
+  movements.put({
+    id: uid(),
+    type: 'log',
+    action: 'undo',
+    text: `desfez ${mv.type === 'in' ? 'entrada' : 'saída'} de ${mv.qty} ${mv.productName}${mv.userName && mv.userName !== stamp().userName ? ` (feita por ${mv.userName})` : ''}`,
+    productId: mv.productId,
+    qty: 0,
+    at: Date.now(),
+    ...stamp(),
+  });
   await new Promise((resolve, reject) => {
     tx.oncomplete = resolve;
     tx.onerror = () => reject(tx.error);

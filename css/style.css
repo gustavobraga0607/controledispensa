@@ -55,6 +55,12 @@ body { padding-bottom: calc(72px + env(safe-area-inset-bottom)); }
 .topbar h1 { margin: 0; font-size: 1.15rem; font-weight: 650; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .icon-btn { background: none; border: 0; color: inherit; font-size: 1.4rem; padding: 4px 8px; cursor: pointer; }
 
+.user-chip {
+  flex-shrink: 0; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 6px 12px; border-radius: 999px; background: rgba(255, 255, 255, 0.18); color: inherit;
+  text-decoration: none; font-size: 0.9rem; font-weight: 600;
+}
+
 main { max-width: 760px; margin: 0 auto; padding: 16px; outline: none; }
 
 .tabbar {
@@ -219,3 +225,22 @@ table.report tr.clickable { cursor: pointer; }
 #toast button { background: none; border: 0; color: #7fd6a0; font: inherit; font-weight: 700; cursor: pointer; }
 
 details summary { cursor: pointer; font-weight: 600; padding: 6px 0; }
+
+.who { font-weight: 600; color: var(--text); display: inline !important; }
+
+.user-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; margin: 12px 0; }
+.user-card {
+  display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 18px 10px;
+  border-radius: var(--radius); border: 2px solid var(--line); background: var(--card); color: var(--text);
+  font: inherit; cursor: pointer; box-shadow: var(--shadow);
+}
+.user-card span { font-size: 2.6rem; line-height: 1; }
+.user-card small { color: var(--muted); }
+.user-card.active { border-color: var(--primary); }
+
+.icon-pick { display: flex; flex-wrap: wrap; gap: 8px; }
+.icon-pick button {
+  width: 48px; height: 48px; font-size: 1.6rem; border-radius: 12px; border: 2px solid var(--line);
+  background: var(--card); cursor: pointer;
+}
+.icon-pick button.active { border-color: var(--primary); background: var(--primary-soft); }

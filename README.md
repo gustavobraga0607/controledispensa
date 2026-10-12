@@ -24,7 +24,14 @@ Funciona no celular, pode ser instalado na tela inicial e funciona offline. Os d
    - Quanto de cada produto foi usado por mês (3, 6 ou 12 meses), com comparativo mês a mês (▲/▼ %), detalhamento por marca, média mensal e quantas semanas o estoque atual dura.
    - Também mostra as compras (entradas) por mês, sugere mínimo/máximo com base no consumo e exporta CSV.
 
-Extras: histórico de movimentações, backup/restauração em JSON, tema claro/escuro.
+6. **Pessoas da casa e log de ações**
+   - Cadastre quem mora na casa (nome, ícone e PIN opcional) e escolha quem está usando pelo botão no topo.
+   - Cada retirada, entrada, desfazer, cadastro/edição/exclusão de produto ou grupo e restauração de backup fica registrada com o nome da pessoa.
+   - O *Histórico* filtra por pessoa e por tipo (retiradas, entradas, outras ações) e mostra o resumo do mês: quanto cada um retirou e guardou.
+   - Opção de perguntar quem está usando sempre que o app abre (celular compartilhado).
+   - O PIN evita usar o nome de outra pessoa por engano; não é uma proteção forte, já que os dados ficam no próprio aparelho.
+
+Extras: backup/restauração em JSON, tema claro/escuro.
 
 ## Como rodar
 

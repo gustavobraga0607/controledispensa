@@ -121,7 +121,13 @@ const routes = [
   [/^\/relatorio$/, relatorio, 'Relatório de consumo', 'relatorio'],
   [/^\/mais$/, mais, 'Mais opções', 'home', true],
   [/^\/historico$/, historico, 'Histórico', 'home', true],
+  [/^\/entrar$/, entrar, 'Quem está usando?', 'home'],
+  [/^\/usuarios$/, usuarios, 'Pessoas da casa', 'home', true],
+  [/^\/usuario\/([\w-]+)$/, usuarioForm, 'Pessoa', 'home', true],
 ];
+
+// Telas liberadas mesmo sem ninguém identificado.
+const OPEN_ROUTES = /^\/(entrar|usuarios|usuario\/novo)$/;
 
 async function router() {
   if (cleanup) {
@@ -135,6 +141,10 @@ async function router() {
   const raw = location.hash.slice(1) || '/';
   const [path, qs] = raw.split('?');
   const params = new URLSearchParams(qs || '');
+  // Com pessoas cadastradas, é preciso escolher quem está usando antes de mexer no estoque.
+  if (!currentUser && !OPEN_ROUTES.test(path) && (await db.all('users')).length) {
+    return go(`#/entrar?next=${encodeURIComponent(raw)}`);
+  }
   for (const [re, fn, title, tab, back] of routes) {
     const m = path.match(re);
     if (!m) continue;
@@ -208,14 +218,29 @@ async function home() {
             <li>Ao usar um produto, bipe para dar saída. A lista de compras se monta sozinha.</li></ol></div>`
         : ''
     }
-    <p class="center" style="margin-top:18px"><a href="#/mais" class="btn sm">⚙️ Grupos, histórico e backup</a></p>`;
+    ${
+      !currentUser
+        ? `<div class="card"><b>👥 Quem retirou? Quem guardou?</b>
+            <p class="small muted" style="margin:6px 0 10px">Cadastre as pessoas da casa para registrar no histórico quem fez cada movimentação.</p>
+            <a class="btn sm primary" href="#/usuario/novo">Cadastrar pessoas</a></div>`
+        : ''
+    }
+    <p class="center" style="margin-top:18px"><a href="#/mais" class="btn sm">⚙️ Pessoas, grupos, histórico e backup</a></p>`;
+}
+
+function who(m) {
+  return m.userName ? `${m.userIcon || '👤'} ${m.userName}` : 'Sem usuário';
 }
 
 function movementRow(m) {
   const d = new Date(m.at);
   const when = d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }) + ' ' + d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  if (m.type === 'log') {
+    return `<li class="item"><div class="info"><b>${esc(m.text)}</b><span class="small muted">${esc(who(m))} · ${when}</span></div><span class="badge warn">📝</span></li>`;
+  }
+  const verb = m.type === 'in' ? 'guardou' : 'retirou';
   const sign = m.type === 'in' ? `<span class="badge">+${fmt(m.qty)}</span>` : `<span class="badge danger">−${fmt(m.qty)}</span>`;
-  return `<li class="item"><div class="info"><b>${esc(m.productName)}</b><span class="small muted">${esc(m.groupName || '')} · ${when}</span></div>${sign}</li>`;
+  return `<li class="item"><div class="info"><b>${esc(m.productName)}</b><span class="small muted"><b class="who">${esc(who(m))}</b> ${verb} · ${when}</span></div>${sign}</li>`;
 }
 
 // ----- Estoque -----
@@ -334,6 +359,7 @@ async function productDetail({ args }) {
   $('#del').onclick = async () => {
     if (!confirm(`Excluir "${p.name}"? O histórico de consumo é mantido no relatório.`)) return;
     await db.remove('products', p.id);
+    await db.log('product-delete', `excluiu o produto ${p.name}`, { productId: p.id });
     toast('Produto excluído');
     go('#/estoque');
   };
@@ -561,6 +587,7 @@ async function productForm({ args, params }) {
           createdAt: Date.now(),
         });
         groupId = g.id;
+        await db.log('group-create', `criou o grupo ${g.name}`);
       }
     }
     const saved = await db.put('products', {
@@ -577,6 +604,7 @@ async function productForm({ args, params }) {
     });
     const initial = editing ? 0 : Number(el('qty').value) || 0;
     if (initial > 0) await db.move(saved.id, 'in', initial);
+    await db.log(editing ? 'product-edit' : 'product-create', `${editing ? 'editou' : 'cadastrou'} o produto ${saved.name}`, { productId: saved.id });
     toast(editing ? 'Produto atualizado' : 'Produto cadastrado');
     if (fromEntrada) go('#/bipar/entrada');
     else if (editing) history.back();
@@ -648,6 +676,7 @@ async function grupoForm({ args }) {
     e.preventDefault();
     const min = Number($('#min').value) || 0;
     await db.put('groups', { ...g, name: $('#name').value.trim(), category: $('#category').value, min, max: Math.max(Number($('#max').value) || 0, min) });
+    await db.log(isNew ? 'group-create' : 'group-edit', `${isNew ? 'criou' : 'editou'} o grupo ${$('#name').value.trim()} (mín ${min} / máx ${Math.max(Number($('#max').value) || 0, min)})`);
     toast('Grupo salvo');
     history.back();
   });
@@ -656,12 +685,14 @@ async function grupoForm({ args }) {
     if (!confirm(`Mover ${items.length} produto(s) para "${target.name}" e apagar "${g.name}"?`)) return;
     for (const p of items) await db.put('products', { ...p, groupId: target.id });
     await db.remove('groups', g.id);
+    await db.log('group-merge', `juntou o grupo ${g.name} com ${target.name}`);
     toast('Grupos unidos');
     go(`#/grupo/${target.id}`);
   });
   $('#del')?.addEventListener('click', async () => {
     if (!confirm(`Excluir o grupo "${g.name}"?`)) return;
     await db.remove('groups', g.id);
+    await db.log('group-delete', `excluiu o grupo ${g.name}`);
     go('#/grupos');
   });
 }
@@ -1011,8 +1042,11 @@ async function mais() {
   const lookup = await db.getMeta('lookupOnline', true);
   view.innerHTML = `
     <div class="card"><ul class="list">
+      <li><a class="item" href="#/usuarios"><div class="info"><b>👥 Pessoas da casa</b><span class="small muted">${
+        currentUser ? `Usando agora: ${esc(currentUser.icon)} ${esc(currentUser.name)}` : 'Registre quem retira e quem guarda'
+      }</span></div>›</a></li>
       <li><a class="item" href="#/grupos"><div class="info"><b>🗂️ Grupos de produtos</b><span class="small muted">Similaridade, estoque mínimo e máximo</span></div>›</a></li>
-      <li><a class="item" href="#/historico"><div class="info"><b>🕒 Histórico de movimentações</b><span class="small muted">Entradas e saídas</span></div>›</a></li>
+      <li><a class="item" href="#/historico"><div class="info"><b>🕒 Histórico</b><span class="small muted">Quem retirou, quem guardou e outras ações</span></div>›</a></li>
     </ul></div>
     <div class="card">
       <label class="row" style="margin:0;color:var(--text);font-size:1rem">
@@ -1042,6 +1076,8 @@ async function mais() {
     if (!confirm('Restaurar o backup vai substituir todos os dados atuais. Continuar?')) return;
     try {
       await db.importAll(JSON.parse(await file.text()));
+      await loadCurrentUser();
+      await db.log('backup-restore', 'restaurou um backup');
       toast('Backup restaurado');
       go('#/');
     } catch (err) {
@@ -1050,11 +1086,220 @@ async function mais() {
   };
 }
 
-async function historico() {
-  const movs = (await db.all('movements')).sort((a, b) => b.at - a.at).slice(0, 200);
-  view.innerHTML = movs.length
-    ? `<div class="card log"><ul class="list">${movs.map(movementRow).join('')}</ul></div>`
-    : '<div class="empty"><span>🕒</span>Nenhuma movimentação ainda.</div>';
+async function historico({ params }) {
+  const [all, users] = await Promise.all([db.all('movements'), db.all('users')]);
+  const fUser = params.get('u') || '';
+  const fType = params.get('t') || '';
+  const link = (u, t) => `#/historico?u=${encodeURIComponent(u)}&t=${t}`;
+  const movs = all
+    .filter((m) => !fUser || (fUser === '_' ? !m.userId : m.userId === fUser))
+    .filter((m) => !fType || m.type === fType)
+    .sort((a, b) => b.at - a.at);
+
+  // Resumo do mês atual por pessoa.
+  const start = new Date();
+  start.setDate(1);
+  start.setHours(0, 0, 0, 0);
+  const summary = new Map();
+  for (const m of all) {
+    if (m.at < start.getTime() || m.type === 'log') continue;
+    const key = m.userId || '_';
+    if (!summary.has(key)) summary.set(key, { label: who(m), out: 0, in: 0 });
+    summary.get(key)[m.type] += Number(m.qty) || 0;
+  }
+  const hasAnon = all.some((m) => !m.userId);
+  const types = [['', 'Tudo'], ['out', '➖ Retiradas'], ['in', '➕ Entradas'], ['log', '📝 Outras ações']];
+
+  view.innerHTML = `
+    ${
+      summary.size
+        ? `<div class="card"><b>Este mês</b><ul class="list">${[...summary.values()]
+            .sort((a, b) => b.out + b.in - (a.out + a.in))
+            .map((s) => `<li class="item"><div class="info"><b>${esc(s.label)}</b></div><span class="badge danger">retirou ${fmt(s.out)}</span><span class="badge">guardou ${fmt(s.in)}</span></li>`)
+            .join('')}</ul></div>`
+        : ''
+    }
+    <div class="chips">
+      <a class="chip ${fUser ? '' : 'active'}" href="${link('', fType)}">Todos</a>
+      ${users.sort(byName).map((u) => `<a class="chip ${fUser === u.id ? 'active' : ''}" href="${link(u.id, fType)}">${esc(u.icon)} ${esc(u.name)}</a>`).join('')}
+      ${hasAnon ? `<a class="chip ${fUser === '_' ? 'active' : ''}" href="${link('_', fType)}">Sem usuário</a>` : ''}
+    </div>
+    <div class="chips">${types.map(([t, l]) => `<a class="chip ${fType === t ? 'active' : ''}" href="${link(fUser, t)}">${l}</a>`).join('')}</div>
+    ${
+      movs.length
+        ? `<div class="card log"><ul class="list">${movs.slice(0, 300).map(movementRow).join('')}</ul></div>
+           ${movs.length > 300 ? `<p class="small muted center">Mostrando as 300 mais recentes de ${movs.length}.</p>` : ''}`
+        : '<div class="empty"><span>🕒</span>Nada registrado com esses filtros.</div>'
+    }`;
+}
+
+// ----- Pessoas da casa -----
+const USER_ICONS = ['👩', '👨', '👧', '👦', '👵', '👴', '🧑', '👱', '🧔', '👩‍🦱', '🐶', '⭐'];
+
+// PIN guardado só como hash. Serve para evitar que alguém use o nome de outra pessoa por engano,
+// não é uma proteção forte (os dados ficam no próprio aparelho).
+async function hashPin(userId, pin) {
+  const text = `dispensa:${userId}:${pin}`;
+  if (crypto.subtle) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  let h = 5381;
+  for (const c of text) h = ((h << 5) + h + c.charCodeAt(0)) >>> 0;
+  return `djb2:${h.toString(16)}`;
+}
+
+let currentUser = null;
+
+function setCurrentUser(user) {
+  currentUser = user || null;
+  db.setActor(currentUser);
+  const btn = document.getElementById('user-btn');
+  btn.hidden = !currentUser;
+  if (currentUser) {
+    btn.textContent = `${currentUser.icon || '👤'} ${currentUser.name}`;
+    btn.title = 'Trocar de pessoa';
+  }
+}
+
+async function loadCurrentUser() {
+  const id = await db.getMeta('currentUserId');
+  const user = id ? await db.get('users', id) : null;
+  setCurrentUser(user);
+}
+
+async function login(user) {
+  setCurrentUser(user);
+  await db.setMeta('currentUserId', user ? user.id : null);
+}
+
+async function entrar({ params }) {
+  const users = (await db.all('users')).sort(byName);
+  const next = params.get('next') || '/';
+  if (!users.length) return go('#/usuario/novo');
+  view.innerHTML = `
+    <p class="muted">Escolha quem está usando o app. Tudo o que for retirado ou guardado fica registrado com o nome da pessoa.</p>
+    <div class="user-grid">${users
+      .map(
+        (u) => `<button class="user-card ${currentUser?.id === u.id ? 'active' : ''}" data-id="${u.id}">
+          <span>${esc(u.icon || '👤')}</span><b>${esc(u.name)}</b>${u.pinHash ? '<small>🔒 PIN</small>' : ''}</button>`,
+      )
+      .join('')}</div>
+    <form id="pin-form" class="card" hidden>
+      <label for="pin" style="margin-top:0">PIN de <span id="pin-name"></span></label>
+      <div class="input-btn"><input id="pin" type="password" inputmode="numeric" autocomplete="off" maxlength="8"><button class="btn primary">Entrar</button></div>
+    </form>
+    <p class="center"><a class="btn sm" href="#/usuarios">Gerenciar pessoas</a></p>`;
+
+  let selected = null;
+  const done = async (u) => {
+    await login(u);
+    toast(`Olá, ${u.name}!`);
+    go(`#${next}`);
+  };
+  view.querySelector('.user-grid').addEventListener('click', (e) => {
+    const card = e.target.closest('[data-id]');
+    if (!card) return;
+    selected = users.find((u) => u.id === card.dataset.id);
+    if (!selected.pinHash) return done(selected);
+    $('#pin-form').hidden = false;
+    $('#pin-name').textContent = selected.name;
+    $('#pin').value = '';
+    $('#pin').focus();
+  });
+  $('#pin-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if ((await hashPin(selected.id, $('#pin').value)) === selected.pinHash) return done(selected);
+    beep(false);
+    toast('PIN incorreto');
+    $('#pin').value = '';
+  });
+}
+
+async function usuarios() {
+  const [users, movs, askOnOpen] = await Promise.all([db.all('users'), db.all('movements'), db.getMeta('askUserOnOpen', false)]);
+  const count = (id) => movs.filter((m) => m.userId === id && m.type !== 'log').length;
+  view.innerHTML = `
+    <p class="muted small">Cada pessoa aparece no histórico como quem retirou, guardou, cadastrou ou editou algo. Os dados ficam neste aparelho.</p>
+    <div class="card"><ul class="list">${
+      users
+        .sort(byName)
+        .map(
+          (u) => `<li><a class="item" href="#/usuario/${u.id}"><span class="thumb">${esc(u.icon || '👤')}</span>
+            <div class="info"><b>${esc(u.name)} ${currentUser?.id === u.id ? '<span class="badge">usando agora</span>' : ''}</b>
+            <span class="small muted">${count(u.id)} movimentação(ões)${u.pinHash ? ' · 🔒 com PIN' : ''}</span></div>›</a></li>`,
+        )
+        .join('') || '<li class="muted">Ninguém cadastrado ainda.</li>'
+    }</ul></div>
+    <a class="btn primary block" href="#/usuario/novo">＋ Adicionar pessoa</a>
+    ${
+      users.length
+        ? `<div class="card" style="margin-top:12px">
+      <label class="row" style="margin:0;color:var(--text);font-size:1rem">
+        <input type="checkbox" id="ask" ${askOnOpen ? 'checked' : ''} style="width:22px;min-height:0">
+        <span>Perguntar quem está usando sempre que abrir o app (bom para celular compartilhado)</span>
+      </label></div>
+      ${currentUser ? '<button class="btn block" id="logout" style="margin-top:4px">🔄 Trocar de pessoa</button>' : ''}`
+        : ''
+    }`;
+  $('#ask')?.addEventListener('change', (e) => db.setMeta('askUserOnOpen', e.target.checked));
+  $('#logout')?.addEventListener('click', async () => {
+    await login(null);
+    go('#/entrar');
+  });
+}
+
+async function usuarioForm({ args }) {
+  const isNew = args[0] === 'novo';
+  const users = await db.all('users');
+  const u = isNew ? { id: db.uid(), name: '', icon: USER_ICONS[users.length % USER_ICONS.length], pinHash: null } : users.find((x) => x.id === args[0]);
+  if (!u) throw new Error('Pessoa não encontrada');
+  // Para editar outra pessoa que tem PIN, é preciso ser ela mesma.
+  if (!isNew && u.pinHash && currentUser?.id !== u.id) throw new Error(`Entre como ${u.name} para editar este cadastro.`);
+  titleEl.textContent = isNew ? 'Nova pessoa' : u.name;
+  let icon = u.icon;
+
+  view.innerHTML = `
+    <form id="f" class="card" autocomplete="off">
+      <label for="name" style="margin-top:0">Nome</label>
+      <input id="name" required maxlength="30" value="${esc(u.name)}" placeholder="Ex.: Ana">
+      <label>Ícone</label>
+      <div class="icon-pick">${USER_ICONS.map((i) => `<button type="button" class="${i === icon ? 'active' : ''}" data-icon="${i}">${i}</button>`).join('')}</div>
+      <label for="pin">PIN (opcional, 4 a 8 números)</label>
+      <input id="pin" type="password" inputmode="numeric" pattern="[0-9]{4,8}" maxlength="8" placeholder="${u.pinHash ? 'Deixe em branco para manter' : 'Sem PIN'}">
+      ${u.pinHash ? '<label class="row" style="color:var(--text)"><input type="checkbox" id="pin-clear" style="width:20px;min-height:0"> Remover PIN</label>' : ''}
+      <button class="btn primary block" style="margin-top:16px" type="submit">Salvar</button>
+    </form>
+    ${isNew ? '' : '<button class="btn danger block" id="del">Remover pessoa</button><p class="small muted center">O histórico dessa pessoa continua guardado.</p>'}`;
+
+  view.querySelector('.icon-pick').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-icon]');
+    if (!b) return;
+    icon = b.dataset.icon;
+    $$('.icon-pick button').forEach((x) => x.classList.toggle('active', x === b));
+  });
+  $('#f').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const name = $('#name').value.trim();
+    if (users.some((x) => x.id !== u.id && x.name.toLowerCase() === name.toLowerCase())) return toast('Já existe alguém com esse nome');
+    const pin = $('#pin').value.trim();
+    let pinHash = u.pinHash || null;
+    if ($('#pin-clear')?.checked) pinHash = null;
+    if (pin) pinHash = await hashPin(u.id, pin);
+    const saved = await db.put('users', { ...u, name, icon, pinHash, createdAt: u.createdAt || Date.now() });
+    // A primeira pessoa cadastrada já passa a ser quem está usando.
+    if (!currentUser || currentUser.id === saved.id) await login(saved);
+    await db.log(isNew ? 'user-create' : 'user-edit', `${isNew ? 'cadastrou' : 'editou'} a pessoa ${saved.name}`);
+    toast(isNew ? `${saved.name} cadastrado(a)` : 'Salvo');
+    go('#/usuarios');
+  });
+  $('#del')?.addEventListener('click', async () => {
+    if (!confirm(`Remover ${u.name}? O histórico continua mostrando o nome.`)) return;
+    await db.remove('users', u.id);
+    await db.log('user-delete', `removeu a pessoa ${u.name}`);
+    if (currentUser?.id === u.id) await login(null);
+    go('#/usuarios');
+  });
 }
 
 // ---------- inicialização ----------
@@ -1063,4 +1308,9 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
-navigate();
+
+(async () => {
+  await loadCurrentUser();
+  if (currentUser && (await db.getMeta('askUserOnOpen', false))) await login(null);
+  navigate();
+})();
