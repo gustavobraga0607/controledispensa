@@ -353,8 +353,12 @@ async function productForm({ args, params }) {
       <div class="photo-pick">
         <span id="photo-prev">${thumb({ photo })}</span>
         <div>
-          <label class="btn" for="photo" style="margin:0;color:var(--text)">📸 ${photo ? 'Trocar foto' : 'Tirar foto'}</label>
+          <div class="row wrap" style="gap:6px">
+            <label class="btn sm" for="photo" style="margin:0;color:var(--text)">📸 ${photo ? 'Nova foto' : 'Tirar foto'}</label>
+            <label class="btn sm" for="photo-gallery" style="margin:0;color:var(--text)">🖼️ Galeria</label>
+          </div>
           <input type="file" id="photo" accept="image/*" capture="environment" hidden>
+          <input type="file" id="photo-gallery" accept="image/*" hidden>
           ${photo ? '<button type="button" class="btn sm" id="photo-clear" style="margin-top:6px">Remover</button>' : ''}
         </div>
       </div>
@@ -394,7 +398,7 @@ async function productForm({ args, params }) {
       ${
         editing
           ? ''
-          : `<label for="qty">Quantidade que tem em casa agora</label><input id="qty" type="number" min="0" step="1" inputmode="numeric" value="${fromEntrada ? 1 : 0}">`
+          : `<label for="qty">Quantidade que tem em casa agora</label><input id="qty" type="number" min="0" step="1" inputmode="numeric" value="${fromEntrada ? Math.max(1, Number(params.get('qty')) || 1) : 0}">`
       }
       <button class="btn primary block" style="margin-top:16px" type="submit">Salvar</button>
     </form>`;
@@ -458,12 +462,20 @@ async function productForm({ args, params }) {
     refreshSuggestion();
   };
 
-  el('photo').addEventListener('change', async (e) => {
+  // Câmera (capture) ou galeria: o mesmo tratamento para os dois.
+  const onPhoto = async (e) => {
     const file = e.target.files[0];
+    e.target.value = '';
     if (!file) return;
-    photo = await resizeImage(file);
-    el('photo-prev').innerHTML = thumb({ photo });
-  });
+    try {
+      photo = await resizeImage(file);
+      el('photo-prev').innerHTML = thumb({ photo });
+    } catch (err) {
+      toast(err.message);
+    }
+  };
+  el('photo').addEventListener('change', onPhoto);
+  el('photo-gallery').addEventListener('change', onPhoto);
   view.addEventListener('click', (e) => {
     if (e.target.id !== 'photo-clear') return;
     photo = null;
@@ -665,13 +677,28 @@ async function bipar({ args }) {
       <a href="#/bipar/saida" class="${out ? 'active out' : ''}">➖ Retirar</a>
       <a href="#/bipar/entrada" class="${out ? '' : 'active in'}">➕ Guardar</a>
     </div>
+    ${
+      out
+        ? ''
+        : `<div class="card qty-picker">
+      <label for="bip-qty" style="margin-top:0">Quantidade a guardar no próximo bipe</label>
+      <div class="row">
+        <button type="button" class="btn" data-step="-1" aria-label="Diminuir">−</button>
+        <input id="bip-qty" type="number" min="1" step="1" inputmode="numeric" value="1">
+        <button type="button" class="btn" data-step="1" aria-label="Aumentar">＋</button>
+      </div>
+      <div class="chips" style="margin:8px 0 0">${[2, 3, 4, 6, 12].map((n) => `<button type="button" class="chip" data-qty="${n}">${n}</button>`).join('')}</div>
+    </div>`
+    }
     <div class="scanner" id="scanner"><video></video><div class="frame"></div><div class="msg" id="cam-msg">Abrindo câmera…</div></div>
     <form id="manual" class="input-btn">
       <input id="code" inputmode="numeric" placeholder="Ou digite / use leitor USB e Enter" autocomplete="off">
       <button class="btn" type="submit">OK</button>
     </form>
     <p class="small muted" style="margin-top:6px">${
-      out ? 'Cada bipe tira 1 unidade do estoque.' : 'Cada bipe adiciona 1 unidade. Produto desconhecido abre o cadastro.'
+      out
+        ? 'Cada bipe tira 1 unidade do estoque.'
+        : 'Escolha a quantidade e bipe o produto uma vez só. Depois do bipe a quantidade volta para 1. Produto desconhecido abre o cadastro.'
     }</p>
     <h2>Nesta sessão</h2>
     <div class="card log"><ul class="list" id="session"><li class="muted">Nenhum produto bipado ainda.</li></ul></div>`;
@@ -690,7 +717,7 @@ async function bipar({ args }) {
           .map(
             (s, i) => `<li class="item">${thumb(s.product)}<div class="info"><b>${esc(productLabel(s.product))}</b>
               <span class="small muted">${esc(s.product.brand || '')} · agora tem ${fmt(s.product.qty)}${s.warning ? ` · ${esc(s.warning)}` : ''}</span></div>
-              <span class="badge ${out ? 'danger' : ''}">${out ? '−' : '+'}1</span>
+              <span class="badge ${out ? 'danger' : ''}">${out ? '−' : '+'}${fmt(s.movement.qty)}</span>
               <button class="btn sm" data-undo="${i}">Desfazer</button></li>`,
           )
           .join('')
@@ -704,6 +731,17 @@ async function bipar({ args }) {
     await db.undo(s.movement.id);
     toast('Desfeito');
     renderSession();
+  });
+
+  // Quantidade por bipe (só na entrada): evita bipar várias vezes o mesmo item.
+  const qtyInput = $('#bip-qty');
+  const getQty = () => (qtyInput ? Math.max(1, Math.floor(Number(qtyInput.value)) || 1) : 1);
+  const setQty = (n) => qtyInput && (qtyInput.value = Math.max(1, n));
+  $('.qty-picker')?.addEventListener('click', (e) => {
+    const step = e.target.closest('[data-step]');
+    const pick = e.target.closest('[data-qty]');
+    if (step) setQty(getQty() + Number(step.dataset.step));
+    if (pick) setQty(Number(pick.dataset.qty));
   });
 
   let stop = null;
@@ -721,13 +759,15 @@ async function bipar({ args }) {
           toast(`Código ${code} não cadastrado`, { label: 'Cadastrar', run: () => go(`#/produto/novo?barcode=${encodeURIComponent(code)}`) });
         } else {
           toast('Produto novo! Vamos cadastrar.');
-          go(`#/produto/novo?barcode=${encodeURIComponent(code)}&from=entrada`);
+          go(`#/produto/novo?barcode=${encodeURIComponent(code)}&from=entrada&qty=${getQty()}`);
         }
         return;
       }
       let warning = '';
       if (out && !(Number(product.qty) > 0)) warning = 'estoque já estava zerado';
-      const res = await db.move(product.id, out ? 'out' : 'in', 1);
+      const qty = out ? 1 : getQty();
+      const res = await db.move(product.id, out ? 'out' : 'in', qty);
+      setQty(1);
       beep(true);
       flash(true);
       session.unshift({ ...res, warning });
@@ -737,7 +777,7 @@ async function bipar({ args }) {
         const total = groupStock(group.id, await db.all('products'));
         if (stockStatus(total, group) === 'comprar') toast(`${group.name}: restam ${fmt(total)}. Foi para a lista de compras 🛒`);
         else toast(`−1 ${product.name}`);
-      } else toast(`${out ? '−1' : '+1'} ${product.name}`);
+      } else toast(`${out ? '−' : '+'}${fmt(qty)} ${product.name}`);
     } finally {
       busy = false;
     }

@@ -167,6 +167,9 @@ a.item { color: inherit; text-decoration: none; }
 .photo-pick { display: flex; gap: 12px; align-items: center; }
 .photo-pick img, .photo-pick .thumb { width: 96px; height: 96px; }
 
+.qty-picker .row input { flex: 1; text-align: center; font-size: 1.3rem; font-weight: 700; }
+.qty-picker .row .btn { min-width: 52px; font-size: 1.3rem; }
+
 .suggest { background: var(--primary-soft); border-radius: 10px; padding: 10px 12px; margin-top: 8px; font-size: 0.9rem; }
 
 .shop-item { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }

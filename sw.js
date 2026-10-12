@@ -1,5 +1,5 @@
 // Service worker: guarda os arquivos do app para funcionar sem internet.
-const CACHE = 'dispensa-v1';
+const CACHE = 'dispensa-v2';
 const ASSETS = [
   './',
   './index.html',

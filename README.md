@@ -6,7 +6,7 @@ Funciona no celular, pode ser instalado na tela inicial e funciona offline. Os d
 ## Funcionalidades
 
 1. **Cadastro de produtos com foto e código de barras**
-   - Foto tirada pela câmera (reduzida automaticamente para não ocupar espaço).
+   - Foto tirada pela câmera ou escolhida da galeria (reduzida automaticamente para não ocupar espaço).
    - Código de barras lido pela câmera, digitado ou por leitor USB/Bluetooth.
    - Opcional: preenche nome, marca, tamanho e foto pela base pública [Open Food Facts](https://world.openfoodfacts.org).
 2. **Agrupamento por similaridade**
@@ -15,7 +15,7 @@ Funciona no celular, pode ser instalado na tela inicial e funciona offline. Os d
    - O estoque é contado pelo grupo (soma de todas as marcas).
 3. **Saída do estoque bipando**
    - Na tela *Bipar → Retirar*, cada leitura tira 1 unidade. Tem botão de desfazer.
-   - Em *Bipar → Guardar*, cada leitura adiciona 1 unidade (para quando chega do mercado). Código desconhecido abre o cadastro.
+   - Em *Bipar → Guardar* (quando chega do mercado), escolha a quantidade antes de bipar (ex.: 12) e bipe o produto uma vez só; depois a quantidade volta para 1. Código desconhecido abre o cadastro já com a quantidade escolhida.
 4. **Lista de compras automática**
    - Cada grupo tem estoque **mínimo** e **máximo**. Quando o total fica igual ou abaixo do mínimo, o grupo entra na lista com a quantidade para chegar ao máximo.
    - Seção "pode completar" para itens entre o mínimo e o máximo.
