@@ -1,366 +1,355 @@
-// Dados na nuvem (Firebase: Authentication + Cloud Firestore).
+// Dados do app guardados no Postgres (Neon) através da API em /api.
 //
-// Cada família tem uma "casa" (households/{casaId}) com os produtos, grupos, movimentações e
-// as pessoas que participam. O Firestore mantém uma cópia local, então o app continua
-// funcionando sem internet e sincroniza quando a conexão volta.
-//
-// As leituras vêm de um cache em memória alimentado por listeners em tempo real; assim as telas
-// abrem na hora e mudanças feitas por outra pessoa aparecem sozinhas.
-
-import { initializeApp } from 'https://www.gstatic.com/firebasejs/12.6.0/firebase-app.js';
-import {
-  getAuth,
-  connectAuthEmulator,
-  onAuthStateChanged,
-  signInWithEmailAndPassword,
-  createUserWithEmailAndPassword,
-  signInWithPopup,
-  GoogleAuthProvider,
-  sendPasswordResetEmail,
-  updateProfile,
-  signOut,
-} from 'https://www.gstatic.com/firebasejs/12.6.0/firebase-auth.js';
-import {
-  initializeFirestore,
-  connectFirestoreEmulator,
-  persistentLocalCache,
-  persistentMultipleTabManager,
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  setDoc,
-  deleteDoc,
-  updateDoc,
-  writeBatch,
-  onSnapshot,
-  query,
-  where,
-  increment,
-  arrayUnion,
-  arrayRemove,
-} from 'https://www.gstatic.com/firebasejs/12.6.0/firebase-firestore.js';
-import { firebaseConfig as fileConfig } from './firebase-config.js';
+// Sem login: o aparelho guarda a chave da casa (vinda do link de convite) e o nome de quem está usando.
+// Tudo fica também numa cópia local (IndexedDB): as telas abrem na hora, o app funciona sem
+// internet e as alterações ficam numa fila que é enviada quando a conexão volta.
 
 const COLLECTIONS = ['groups', 'products', 'movements', 'meta', 'users'];
-const HISTORY_DAYS = 400; // movimentações carregadas (relatório de até 12 meses + folga)
-const CONFIG_KEY = 'dispensa:firebaseConfig';
-const HOUSEHOLD_KEY = 'dispensa:household';
+const KEY_STORAGE = 'dispensa:houseKey';
+const PERSON_STORAGE = 'dispensa:person';
+const SYNC_EVERY_MS = 15_000;
+const BATCH = 200;
 
-let app = null;
-let auth = null;
-let fs = null;
-let authUser = null;
-let house = null; // { id, name, inviteCode, members }
-let unsubs = [];
-let ready = Promise.resolve();
 const cache = Object.fromEntries(COLLECTIONS.map((c) => [c, new Map()]));
+let house = null; // { id, name }
+let cursor = 0;
+let outbox = [];
+let ready = Promise.resolve();
+let syncing = null;
+let syncTimer = null;
+let lastError = null;
 const changeListeners = new Set();
 
-// ---------- configuração ----------
+// ---------- cópia local (IndexedDB) ----------
 
-export function getConfig() {
-  if (fileConfig && fileConfig.apiKey) return fileConfig;
+let idbPromise = null;
+function idb() {
+  if (!idbPromise) {
+    idbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open('dispensa-nuvem', 1);
+      req.onupgradeneeded = () => {
+        req.result.createObjectStore('docs', { keyPath: ['col', 'id'] });
+        req.result.createObjectStore('kv', { keyPath: 'k' });
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  return idbPromise;
+}
+
+function idbReq(req) {
+  return new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function localLoad() {
+  const d = await idb();
+  const tx = d.transaction(['docs', 'kv'], 'readonly');
+  const [docs, kv] = await Promise.all([idbReq(tx.objectStore('docs').getAll()), idbReq(tx.objectStore('kv').getAll())]);
+  for (const c of COLLECTIONS) cache[c].clear();
+  for (const row of docs) if (cache[row.col]) cache[row.col].set(row.id, row.data);
+  const vals = Object.fromEntries(kv.map((r) => [r.k, r.v]));
+  cursor = vals.cursor || 0;
+  outbox = vals.outbox || [];
+  house = vals.house || null;
+}
+
+// Grava em segundo plano; a fonte da verdade em memória é o `cache`.
+let pendingDocs = new Map();
+let pendingKv = new Map();
+let flushLocalTimer = null;
+function localSaveDoc(col, id, data) {
+  pendingDocs.set(`${col}\u0000${id}`, { col, id, data });
+  scheduleLocalFlush();
+}
+function localSaveKv(k, v) {
+  pendingKv.set(k, v);
+  scheduleLocalFlush();
+}
+function scheduleLocalFlush() {
+  clearTimeout(flushLocalTimer);
+  flushLocalTimer = setTimeout(flushLocal, 50);
+}
+async function flushLocal() {
+  const docs = [...pendingDocs.values()];
+  const kv = [...pendingKv.entries()];
+  pendingDocs = new Map();
+  pendingKv = new Map();
+  if (!docs.length && !kv.length) return;
   try {
-    return JSON.parse(localStorage.getItem(CONFIG_KEY)) || null;
+    const d = await idb();
+    const tx = d.transaction(['docs', 'kv'], 'readwrite');
+    for (const r of docs) {
+      if (r.data === null) tx.objectStore('docs').delete([r.col, r.id]);
+      else tx.objectStore('docs').put(r);
+    }
+    for (const [k, v] of kv) tx.objectStore('kv').put({ k, v });
+  } catch (err) {
+    console.warn('Cópia local indisponível', err);
+  }
+}
+
+async function localClear() {
+  const d = await idb();
+  const tx = d.transaction(['docs', 'kv'], 'readwrite');
+  tx.objectStore('docs').clear();
+  tx.objectStore('kv').clear();
+  await new Promise((resolve) => (tx.oncomplete = resolve));
+}
+
+// ---------- API ----------
+
+export function houseKey() {
+  try {
+    return localStorage.getItem(KEY_STORAGE);
   } catch {
     return null;
   }
 }
 
-export function isConfigured() {
-  return Boolean(getConfig());
-}
-
-export function configFromFile() {
-  return Boolean(fileConfig && fileConfig.apiKey);
-}
-
-// Aceita o trecho copiado do console do Firebase (objeto JS) ou JSON puro.
-export function parseConfig(text) {
-  const body = String(text).match(/\{[\s\S]*\}/);
-  if (!body) throw new Error('Cole o bloco firebaseConfig = { ... } do console do Firebase.');
-  const json = body[0]
-    .replace(/\/\/.*$/gm, '')
-    .replace(/([{,]\s*)([A-Za-z_$][\w$]*)\s*:/g, '$1"$2":')
-    .replace(/'/g, '"')
-    .replace(/,\s*}/g, '}');
-  const cfg = JSON.parse(json);
-  if (!cfg.apiKey || !cfg.projectId) throw new Error('Configuração incompleta: faltam apiKey ou projectId.');
-  return cfg;
-}
-
-export function saveConfig(cfg) {
-  localStorage.setItem(CONFIG_KEY, JSON.stringify(cfg));
-}
-
-export function clearConfig() {
-  localStorage.removeItem(CONFIG_KEY);
-}
-
-// ---------- inicialização e login ----------
-
-// Inicia o Firebase e resolve com o usuário logado (ou null) assim que o login for conhecido.
-export function init() {
-  const cfg = getConfig();
-  if (!cfg) return Promise.resolve(null);
-  app = initializeApp(cfg);
-  auth = getAuth(app);
-  fs = initializeFirestore(app, {
-    ignoreUndefinedProperties: true,
-    localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
-  });
-  // Projetos "demo-*" usam os emuladores locais do Firebase (desenvolvimento e testes).
-  if (cfg.projectId.startsWith('demo-')) {
-    connectAuthEmulator(auth, `http://${location.hostname}:9099`, { disableWarnings: true });
-    connectFirestoreEmulator(fs, location.hostname, 8080);
-  }
-  return new Promise((resolve) => {
-    let first = true;
-    onAuthStateChanged(auth, async (user) => {
-      const changed = !first && (user?.uid || null) !== (authUser?.uid || null);
-      authUser = user;
-      if (!user) closeHousehold();
-      if (first) {
-        first = false;
-        resolve(user);
-      } else if (changed) {
-        emit({ type: 'auth' });
-      }
+async function api(path, { method = 'GET', body, key = houseKey() } = {}) {
+  let res;
+  try {
+    res = await fetch(`api/${path}`, {
+      method,
+      headers: { 'Content-Type': 'application/json', ...(key ? { 'X-House-Key': key } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
     });
-  });
-}
-
-export function currentAuthUser() {
-  return authUser;
-}
-
-const AUTH_ERRORS = {
-  'auth/invalid-credential': 'E-mail ou senha incorretos.',
-  'auth/wrong-password': 'E-mail ou senha incorretos.',
-  'auth/user-not-found': 'E-mail ou senha incorretos.',
-  'auth/invalid-email': 'E-mail inválido.',
-  'auth/email-already-in-use': 'Já existe uma conta com esse e-mail. Use "Entrar".',
-  'auth/weak-password': 'A senha precisa ter pelo menos 6 caracteres.',
-  'auth/popup-closed-by-user': 'Login cancelado.',
-  'auth/popup-blocked': 'O navegador bloqueou a janela do Google. Tente de novo ou use e-mail e senha.',
-  'auth/network-request-failed': 'Sem internet. Conecte-se para entrar.',
-  'auth/too-many-requests': 'Muitas tentativas. Aguarde um pouco e tente de novo.',
-  'auth/operation-not-allowed': 'Esse tipo de login não está ativado no projeto Firebase.',
-  'auth/unauthorized-domain': 'Este endereço não está autorizado no Firebase (Authentication → Settings → Authorized domains).',
-};
-
-function friendly(err) {
-  const msg = AUTH_ERRORS[err?.code];
-  return msg ? new Error(msg) : err;
-}
-
-export async function loginEmail(email, password) {
-  try {
-    return (await signInWithEmailAndPassword(auth, email, password)).user;
-  } catch (err) {
-    throw friendly(err);
+  } catch {
+    throw Object.assign(new Error('Sem conexão com o servidor.'), { offline: true });
   }
-}
-
-export async function signupEmail(name, email, password) {
+  let data = null;
   try {
-    const { user } = await createUserWithEmailAndPassword(auth, email, password);
-    if (name) await updateProfile(user, { displayName: name });
-    return user;
-  } catch (err) {
-    throw friendly(err);
+    data = await res.json();
+  } catch {
+    /* resposta sem JSON */
   }
-}
-
-export async function loginGoogle() {
-  try {
-    return (await signInWithPopup(auth, new GoogleAuthProvider())).user;
-  } catch (err) {
-    throw friendly(err);
+  if (!res.ok) {
+    const msg = data?.error || (res.status === 404 ? 'Servidor não encontrado: publique o app na Vercel (veja o README).' : `Erro ${res.status}`);
+    throw Object.assign(new Error(msg), { status: res.status });
   }
+  return data;
 }
 
-export async function resetPassword(email) {
-  try {
-    await sendPasswordResetEmail(auth, email);
-  } catch (err) {
-    throw friendly(err);
-  }
-}
-
-export async function logout() {
-  closeHousehold();
-  localStorage.removeItem(HOUSEHOLD_KEY);
-  await signOut(auth);
-}
-
-// ---------- casa (household) ----------
+// ---------- casa ----------
 
 export function household() {
   return house;
 }
 
-export function lastHouseholdId() {
-  return localStorage.getItem(HOUSEHOLD_KEY);
+// Sem chave: informa se já existe uma casa criada no servidor.
+export async function serverStatus() {
+  return api('house', { key: null });
 }
 
-export async function myHouseholds() {
-  const snap = await getDocs(query(collection(fs, 'households'), where('members', 'array-contains', authUser.uid)));
-  return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+export async function createHouse(name) {
+  const { key, house: h } = await api('house', { method: 'POST', body: { action: 'create', name }, key: null });
+  await adoptKey(key, h);
+  return h;
 }
 
-function randomCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sem 0/O/1/I para não confundir
-  const bytes = crypto.getRandomValues(new Uint8Array(6));
-  return [...bytes].map((b) => chars[b % chars.length]).join('');
+// Usa a chave vinda do link de convite.
+export async function joinWithKey(key) {
+  key = String(key || '').trim();
+  const m = key.match(/[?&]k=([\w-]+)/);
+  if (m) key = m[1];
+  if (!/^[\w-]{10,}$/.test(key)) throw new Error('Link de convite inválido.');
+  const { house: h } = await api('house', { key });
+  await adoptKey(key, h);
+  return h;
 }
 
-function memberProfile(profile) {
-  return {
-    id: authUser.uid,
-    name: profile.name || authUser.displayName || (authUser.email || '').split('@')[0] || 'Eu',
-    icon: profile.icon || '🙂',
-    email: authUser.email || '',
-    joinedAt: Date.now(),
-  };
-}
-
-export async function createHousehold(name, profile) {
-  const ref = doc(collection(fs, 'households'));
-  const code = randomCode();
-  const batch = writeBatch(fs);
-  batch.set(ref, { name, members: [authUser.uid], inviteCode: code, createdBy: authUser.uid, createdAt: Date.now() });
-  batch.set(doc(fs, 'invites', code), { householdId: ref.id, createdAt: Date.now() });
-  batch.set(doc(ref, 'users', authUser.uid), memberProfile(profile));
-  await batch.commit();
-  await openHousehold(ref.id);
-  return house;
-}
-
-export async function joinHousehold(code, profile) {
-  code = String(code).trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
-  let invite;
-  try {
-    invite = await getDoc(doc(fs, 'invites', code));
-  } catch (err) {
-    throw new Error(err.code === 'unavailable' ? 'Sem internet. Conecte-se para entrar na casa.' : err.message);
+async function adoptKey(key, h) {
+  if (houseKey() !== key || house?.id !== h.id) {
+    await localClear();
+    for (const c of COLLECTIONS) cache[c].clear();
+    cursor = 0;
+    outbox = [];
   }
-  if (!invite.exists()) throw new Error('Código de convite não encontrado. Confira as letras e números.');
-  const hid = invite.data().householdId;
-  const ref = doc(fs, 'households', hid);
-  await updateDoc(ref, { members: arrayUnion(authUser.uid), joinCode: code });
-  await setDoc(doc(ref, 'users', authUser.uid), memberProfile(profile));
-  await openHousehold(hid);
-  return house;
+  localStorage.setItem(KEY_STORAGE, key);
+  house = h;
+  localSaveKv('house', h);
+  ready = sync().catch(() => {});
+  await ready;
+  startAutoSync();
 }
 
-// Gera um código novo (o antigo deixa de funcionar).
-export async function newInviteCode() {
-  const code = randomCode();
-  const ref = doc(fs, 'households', house.id);
-  const batch = writeBatch(fs);
-  batch.set(doc(fs, 'invites', code), { householdId: house.id, createdAt: Date.now() });
-  if (house.inviteCode) batch.delete(doc(fs, 'invites', house.inviteCode));
-  batch.update(ref, { inviteCode: code });
-  await batch.commit();
-  return code;
+export function inviteLink() {
+  const key = houseKey();
+  return key ? `${location.origin}${location.pathname}#/convite?k=${key}` : null;
 }
 
-export async function renameHousehold(name) {
-  await commitLater(updateDoc(doc(fs, 'households', house.id), { name }));
-  house.name = name;
+export async function renameHouse(name) {
+  const { house: h } = await api('house', { method: 'POST', body: { action: 'rename', name } });
+  house = h;
+  localSaveKv('house', h);
 }
 
-export async function leaveHousehold() {
-  const ref = doc(fs, 'households', house.id);
-  await deleteDoc(doc(ref, 'users', authUser.uid));
-  await updateDoc(ref, { members: arrayRemove(authUser.uid) });
-  closeHousehold();
-  localStorage.removeItem(HOUSEHOLD_KEY);
+// Gera um link novo. Os outros aparelhos precisam abrir o link novo.
+export async function rotateKey() {
+  const { key } = await api('house', { method: 'POST', body: { action: 'rotate' } });
+  localStorage.setItem(KEY_STORAGE, key);
+  return key;
 }
 
-export function profile() {
-  return authUser && house ? cache.users.get(authUser.uid) || null : null;
-}
-
-export async function saveProfile(data) {
-  const current = profile() || memberProfile({});
-  return put('users', { ...current, ...data, id: authUser.uid });
-}
-
-function closeHousehold() {
-  unsubs.forEach((u) => u());
-  unsubs = [];
+// Desconecta este aparelho da casa (os dados continuam no servidor).
+export async function forgetHouse() {
+  stopAutoSync();
+  localStorage.removeItem(KEY_STORAGE);
+  localStorage.removeItem(PERSON_STORAGE);
   house = null;
+  outbox = [];
+  cursor = 0;
   for (const c of COLLECTIONS) cache[c].clear();
+  await localClear();
 }
 
-// Abre a casa e começa a escutar as coleções. Resolve quando os dados iniciais chegaram.
-export function openHousehold(hid) {
-  closeHousehold();
-  localStorage.setItem(HOUSEHOLD_KEY, hid);
-  const ref = doc(fs, 'households', hid);
-  const waits = [];
-  const listen = (name, target, onData) =>
-    new Promise((resolve, reject) => {
-      let first = true;
-      const unsub = onSnapshot(
-        target,
-        (snap) => {
-          onData(snap);
-          if (first) {
-            first = false;
-            resolve();
-          } else if (!snap.metadata.hasPendingWrites) {
-            // Mudança vinda de outro aparelho.
-            emit({ type: 'remote', collection: name });
-          }
-        },
-        (err) => {
-          if (first) reject(err);
-          else console.error(name, err);
-        },
-      );
-      unsubs.push(unsub);
-    });
+// ---------- quem está usando (sem senha) ----------
 
-  waits.push(
-    listen('household', ref, (snap) => {
-      if (!snap.exists() || !(snap.data().members || []).includes(authUser.uid)) {
-        house = null;
-        return;
-      }
-      house = { id: snap.id, ...snap.data() };
-    }),
-  );
-  for (const name of COLLECTIONS) {
-    let target = collection(ref, name);
-    if (name === 'movements') target = query(target, where('at', '>=', Date.now() - HISTORY_DAYS * 864e5));
-    waits.push(
-      listen(name, target, (snap) => {
-        for (const change of snap.docChanges()) {
-          if (change.type === 'removed') cache[name].delete(change.doc.id);
-          else cache[name].set(change.doc.id, { ...change.doc.data(), id: change.doc.id });
-        }
-      }),
-    );
+export function person() {
+  let id = null;
+  try {
+    id = localStorage.getItem(PERSON_STORAGE);
+  } catch {
+    /* sem armazenamento */
   }
-  ready = Promise.all(waits).then(
-    () => {
-      if (!house) throw new Error('Você não faz parte desta casa.');
-      return house;
-    },
-    (err) => {
-      closeHousehold();
-      localStorage.removeItem(HOUSEHOLD_KEY);
-      throw err.code === 'permission-denied' ? new Error('Sem acesso a esta casa.') : err;
-    },
-  );
-  return ready;
+  const p = id ? cache.users.get(id) : null;
+  return p && !p.removed ? { ...p } : null;
 }
 
-// Avisos de mudanças: { type: 'remote', collection } ou { type: 'auth' }.
+export function setPerson(id) {
+  if (id) localStorage.setItem(PERSON_STORAGE, id);
+  else localStorage.removeItem(PERSON_STORAGE);
+}
+
+function stamp() {
+  const p = person();
+  return { userId: p?.id || null, userName: p?.name || '', userIcon: p?.icon || '' };
+}
+
+// ---------- sincronização ----------
+
+export async function init() {
+  if (!houseKey()) return;
+  try {
+    await localLoad();
+  } catch (err) {
+    console.warn(err);
+  }
+  // Primeira vez neste aparelho: espera baixar os dados. Depois, usa a cópia local na hora.
+  ready = cursor ? Promise.resolve() : sync().catch(() => {});
+  if (cursor) sync().catch(() => {});
+  await ready;
+  startAutoSync();
+}
+
+function startAutoSync() {
+  stopAutoSync();
+  syncTimer = setInterval(() => document.visibilityState === 'visible' && sync().catch(() => {}), SYNC_EVERY_MS);
+  window.addEventListener('online', onWake);
+  document.addEventListener('visibilitychange', onWake);
+}
+
+function stopAutoSync() {
+  clearInterval(syncTimer);
+  window.removeEventListener('online', onWake);
+  document.removeEventListener('visibilitychange', onWake);
+}
+
+function onWake() {
+  if (document.visibilityState === 'visible') sync().catch(() => {});
+}
+
+// Envia a fila e baixa o que mudou. Chamadas simultâneas reaproveitam a mesma execução.
+export function sync() {
+  if (!houseKey()) return Promise.resolve();
+  if (!syncing) {
+    syncing = (async () => {
+      try {
+        await pushOutbox();
+        const res = await api(`sync?since=${cursor}`);
+        let changed = false;
+        for (const d of res.docs) {
+          if (!cache[d.col]) continue;
+          // Não sobrescreve o que ainda está na fila para subir.
+          if (outbox.some((op) => op.col === d.col && op.docId === d.id)) continue;
+          const current = cache[d.col].get(d.id);
+          if (d.deleted) {
+            if (current) {
+              cache[d.col].delete(d.id);
+              localSaveDoc(d.col, d.id, null);
+              changed = true;
+            }
+          } else {
+            const data = { ...d.data, id: d.col === 'meta' ? d.data.key : d.id };
+            if (JSON.stringify(current) !== JSON.stringify(data)) {
+              cache[d.col].set(d.id, data);
+              localSaveDoc(d.col, d.id, data);
+              changed = true;
+            }
+          }
+        }
+        if (res.house && res.house.name !== house?.name) {
+          house = res.house;
+          localSaveKv('house', house);
+          changed = true;
+        }
+        cursor = res.now;
+        localSaveKv('cursor', cursor);
+        if (lastError) {
+          lastError = null;
+          emit({ type: 'status' });
+        }
+        if (changed) emit({ type: 'remote' });
+      } catch (err) {
+        lastError = err;
+        if (err.status === 401) {
+          await forgetHouse();
+          emit({ type: 'auth', error: err });
+        } else {
+          emit({ type: 'status' });
+        }
+        throw err;
+      } finally {
+        syncing = null;
+      }
+    })();
+  }
+  return syncing;
+}
+
+async function pushOutbox() {
+  while (outbox.length) {
+    const batch = outbox.slice(0, BATCH);
+    try {
+      await api('ops', { method: 'POST', body: { ops: batch } });
+    } catch (err) {
+      // Lote recusado pelo servidor (dado inválido): descarta para não travar a fila para sempre.
+      if (!(err.status >= 400 && err.status < 500 && err.status !== 401)) throw err;
+      console.error('Alterações recusadas pelo servidor', err, batch);
+    }
+    const sent = new Set(batch.map((op) => op.id));
+    outbox = outbox.filter((op) => !sent.has(op.id));
+    localSaveKv('outbox', outbox);
+  }
+}
+
+let pushTimer = null;
+function enqueue(...ops) {
+  outbox.push(...ops.map((op) => ({ id: uid() + uid(), ...op })));
+  localSaveKv('outbox', outbox);
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(() => sync().catch(() => {}), 300);
+  emit({ type: 'status' });
+}
+
+export function syncStatus() {
+  return { pending: outbox.length, error: lastError ? lastError.message : null, offline: Boolean(lastError?.offline) };
+}
+
 export function onChange(fn) {
   changeListeners.add(fn);
   return () => changeListeners.delete(fn);
@@ -376,23 +365,14 @@ export function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
-function col(name) {
-  if (!house) throw new Error('Nenhuma casa aberta.');
-  return collection(fs, 'households', house.id, name);
+function keyOf(name, value) {
+  return name === 'meta' ? value.key : value.id;
 }
 
-// Gravações não esperam o servidor: offline elas ficam na fila e sobem quando a internet voltar.
-function commitLater(promise) {
-  promise.catch((err) => {
-    console.error(err);
-    emit({ type: 'error', error: err });
-  });
-  return Promise.resolve();
-}
-
-function stamp() {
-  const me = profile();
-  return { userId: authUser?.uid || null, userName: me?.name || authUser?.displayName || authUser?.email || '', userIcon: me?.icon || '' };
+function setLocal(name, id, data) {
+  if (data === null) cache[name].delete(id);
+  else cache[name].set(id, data);
+  localSaveDoc(name, id, data);
 }
 
 export async function all(name) {
@@ -406,21 +386,17 @@ export async function get(name, id) {
   return v ? { ...v } : undefined;
 }
 
-function keyOf(name, value) {
-  return name === 'meta' ? value.key : value.id;
-}
-
 export async function put(name, value) {
   const id = keyOf(name, value);
-  const data = { ...value };
-  cache[name].set(id, { ...data, id });
-  await commitLater(setDoc(doc(col(name), id), data));
+  const data = { ...value, id: name === 'meta' ? value.key : value.id };
+  setLocal(name, id, data);
+  enqueue({ op: 'put', col: name, docId: id, data });
   return value;
 }
 
 export async function remove(name, id) {
-  cache[name].delete(id);
-  await commitLater(deleteDoc(doc(col(name), id)));
+  setLocal(name, id, null);
+  enqueue({ op: 'remove', col: name, docId: id });
 }
 
 export async function findProductByBarcode(barcode) {
@@ -438,8 +414,8 @@ export async function setMeta(key, value) {
   return put('meta', { key, value });
 }
 
-// Movimenta o estoque de um produto e registra quem fez.
-// Usa increment() para somar corretamente quando dois celulares mexem ao mesmo tempo.
+// Movimenta o estoque e registra quem fez. O servidor soma a diferença (não sobrescreve a quantidade),
+// então duas pessoas mexendo ao mesmo tempo não perdem nenhuma baixa.
 export async function move(productId, type, qty = 1) {
   await ready;
   const product = cache.products.get(productId);
@@ -458,16 +434,15 @@ export async function move(productId, type, qty = 1) {
     at: Date.now(),
     ...stamp(),
   };
-  const changes = { qty: increment(delta) };
-  if (type === 'in') changes.lastInAt = Date.now();
-  const batch = writeBatch(fs);
-  batch.update(doc(col('products'), productId), changes);
-  batch.set(doc(col('movements'), movement.id), movement);
-  product.qty = current + delta;
-  if (type === 'in') product.lastInAt = changes.lastInAt;
-  cache.movements.set(movement.id, movement);
-  await commitLater(batch.commit());
-  return { product: { ...product }, movement };
+  const set = type === 'in' ? { lastInAt: movement.at } : {};
+  const updated = { ...product, ...set, qty: current + delta };
+  setLocal('products', productId, updated);
+  setLocal('movements', movement.id, movement);
+  enqueue(
+    { op: 'inc', col: 'products', docId: productId, field: 'qty', delta, set },
+    { op: 'put', col: 'movements', docId: movement.id, data: movement },
+  );
+  return { product: { ...updated }, movement };
 }
 
 // Registra no log uma ação que não mexe no estoque (cadastro, edição, exclusão…).
@@ -481,14 +456,16 @@ export async function undo(movementId) {
   const mv = cache.movements.get(movementId);
   if (!mv) return null;
   const me = stamp();
-  const batch = writeBatch(fs);
-  const product = cache.products.get(mv.productId);
+  const ops = [];
+  let product = cache.products.get(mv.productId);
   if (product) {
     const delta = mv.type === 'in' ? -Math.min(mv.qty, Number(product.qty) || 0) : mv.qty;
-    batch.update(doc(col('products'), mv.productId), { qty: increment(delta) });
-    product.qty = (Number(product.qty) || 0) + delta;
+    product = { ...product, qty: (Number(product.qty) || 0) + delta };
+    setLocal('products', product.id, product);
+    ops.push({ op: 'inc', col: 'products', docId: product.id, field: 'qty', delta });
   }
-  batch.delete(doc(col('movements'), movementId));
+  setLocal('movements', movementId, null);
+  ops.push({ op: 'remove', col: 'movements', docId: movementId });
   const entry = {
     id: uid(),
     type: 'log',
@@ -499,38 +476,42 @@ export async function undo(movementId) {
     at: Date.now(),
     ...me,
   };
-  batch.set(doc(col('movements'), entry.id), entry);
-  cache.movements.delete(movementId);
-  cache.movements.set(entry.id, entry);
-  await commitLater(batch.commit());
+  setLocal('movements', entry.id, entry);
+  ops.push({ op: 'put', col: 'movements', docId: entry.id, data: entry });
+  enqueue(...ops);
   return product ? { ...product } : null;
 }
 
 export async function exportAll() {
   await ready;
-  const data = { app: 'controle-dispensa', version: 2, household: house?.name || '', exportedAt: new Date().toISOString() };
+  const data = { app: 'controle-dispensa', version: 3, household: house?.name || '', exportedAt: new Date().toISOString() };
   for (const name of COLLECTIONS) data[name] = await all(name);
   return data;
 }
 
 // Restaura um backup (ou importa os dados antigos que estavam só no aparelho).
-// `replace`: apaga antes os dados atuais da casa. As pessoas (contas) nunca são importadas.
+// `replace`: apaga antes os dados atuais. As pessoas só são importadas se ainda não existirem.
 export async function importAll(data, { replace = true } = {}) {
   if (!data || data.app !== 'controle-dispensa') throw new Error('Arquivo de backup inválido');
   await ready;
   const ops = [];
-  for (const name of ['groups', 'products', 'movements', 'meta']) {
-    if (replace) for (const id of cache[name].keys()) ops.push((b) => b.delete(doc(col(name), id)));
+  for (const name of COLLECTIONS) {
+    if (replace && name !== 'users') {
+      for (const id of [...cache[name].keys()]) {
+        setLocal(name, id, null);
+        ops.push({ op: 'remove', col: name, docId: id });
+      }
+    }
     for (const row of data[name] || []) {
       const id = keyOf(name, row);
-      if (id) ops.push((b) => b.set(doc(col(name), id), row));
+      if (!id || (name === 'users' && cache.users.has(id))) continue;
+      const { pinHash, ...clean } = row; // PIN da versão antiga não é mais usado
+      const doc = { ...clean, id };
+      setLocal(name, id, doc);
+      ops.push({ op: 'put', col: name, docId: id, data: doc });
     }
   }
-  // Firestore aceita até 500 operações por lote.
-  for (let i = 0; i < ops.length; i += 400) {
-    const batch = writeBatch(fs);
-    ops.slice(i, i + 400).forEach((op) => op(batch));
-    await batch.commit();
-  }
+  enqueue(...ops);
+  await sync().catch(() => {});
   return ops.length;
 }

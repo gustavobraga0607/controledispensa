@@ -1,8 +1,10 @@
 # Dispensa — controle de compras e estoque da casa
 
 App web (PWA) para controlar o estoque da dispensa e montar a lista de compras do mercado.
-Funciona no celular e pode ser instalado na tela inicial. Os dados ficam **na nuvem (Firebase)**, sincronizados
-em tempo real entre os celulares da família, e o app continua funcionando sem internet (as mudanças sobem quando a conexão volta).
+Funciona no celular e pode ser instalado na tela inicial. Os dados ficam num banco **Postgres no Neon**,
+sincronizados entre os celulares da família, **sem login nem senha**: quem cria a casa envia um link de convite,
+e cada celular só escolhe "quem está usando". O app continua funcionando sem internet (as alterações ficam
+numa fila e são enviadas quando a conexão volta).
 
 ## Funcionalidades
 
@@ -25,53 +27,62 @@ em tempo real entre os celulares da família, e o app continua funcionando sem i
    - Quanto de cada produto foi usado por mês (3, 6 ou 12 meses), com comparativo mês a mês (▲/▼ %), detalhamento por marca, média mensal e quantas semanas o estoque atual dura.
    - Também mostra as compras (entradas) por mês, sugere mínimo/máximo com base no consumo e exporta CSV.
 
-6. **Nuvem, família e log de ações**
-   - Cada pessoa entra com a própria conta (e-mail/senha ou Google) no próprio celular.
-   - Os dados ficam numa **casa** compartilhada. Quem cria a casa recebe um **código de convite** (ex.: `K7Q2MX`), e os outros entram digitando esse código.
-   - Mudanças feitas por uma pessoa aparecem sozinhas para as outras.
+6. **Família, sincronização e log de ações (sem login)**
+   - Quem abre o app pela primeira vez cria a **casa** e recebe um **link de convite** (⚙️ → Casa e pessoas → Enviar convite).
+   - Cada pessoa abre o link no próprio celular e escolhe quem é (nome e ícone). Sem e-mail e sem senha.
+   - O nome de quem está usando aparece no topo; tocando nele dá para trocar (celular compartilhado).
+   - Os celulares sincronizam sozinhos (a cada 15 segundos, ao abrir o app e quando a internet volta).
    - Cada retirada, entrada, desfazer, cadastro/edição/exclusão de produto ou grupo e restauração de backup fica registrada com o nome de quem fez.
    - O *Histórico* filtra por pessoa e por tipo e mostra o resumo do mês: quanto cada um retirou e guardou.
-   - Só quem faz parte da casa vê e altera os dados dela (regras em `firestore.rules`).
-   - Quem já usava a versão anterior (dados só no aparelho) vê em ⚙️ o botão **Enviar para a casa** para levar tudo para a nuvem.
+   - Quem tem o link acessa a casa. Se o link vazar, gere um novo em *Configurações da casa* (o antigo para de funcionar).
+   - Quem usava a versão anterior (dados só no aparelho) vê em ⚙️ o botão **Enviar para a casa**.
 
 Extras: backup/restauração em JSON, tema claro/escuro.
 
-## Configurar a nuvem (Firebase) — uma vez só
+## Publicar (Vercel + Neon) — uma vez só
 
-O plano gratuito (Spark) do Firebase é suficiente para uma família.
+O banco fica no **Neon** e a pequena API que conversa com ele roda na **Vercel**. Os dois têm plano gratuito.
+O navegador nunca recebe a senha do banco: ela fica só na Vercel.
 
-1. Acesse <https://console.firebase.google.com> e clique em **Criar projeto** (pode desativar o Google Analytics).
-2. **Authentication → Vamos começar → Método de login**: ative **E-mail/senha**. Opcional: ative **Google**.
-3. **Firestore Database → Criar banco de dados**: escolha um local (ex.: `southamerica-east1`, São Paulo) e o modo de produção.
-   Depois, na aba **Regras**, apague o conteúdo, cole o arquivo [`firestore.rules`](firestore.rules) e clique em **Publicar**.
-4. **Configurações do projeto (⚙️) → Seus apps → Web (`</>`)**: registre o app e copie o objeto `firebaseConfig`.
-5. Cole o `firebaseConfig` em [`js/firebase-config.js`](js/firebase-config.js) (troque o `null`) e faça commit.
-   Se preferir, deixe `null`: o app pede a configuração na primeira abertura, mas aí é preciso colar em cada celular.
-6. Publique o app num endereço **HTTPS** (a câmera e o login exigem HTTPS):
-   - **GitHub Pages**: *Settings → Pages → Deploy from branch*. Depois, no Firebase, em
-     **Authentication → Configurações → Domínios autorizados**, adicione `SEU-USUARIO.github.io`.
-   - ou **Firebase Hosting**: `npx firebase-tools login` e `npx firebase-tools deploy --project SEU-PROJETO`
-     (publica o app e as regras; o domínio já vem autorizado).
-7. Abra o app no celular, crie sua conta, crie a casa e envie o código de convite para a família (⚙️ → Casa e pessoas → Enviar convite).
+1. Crie uma conta em <https://vercel.com> (pode entrar com o GitHub) e clique em **Add New → Project**.
+2. Importe este repositório (`controledispensa`) e clique em **Deploy**. Não precisa configurar build.
+3. No projeto da Vercel, abra **Storage → Create Database → Neon (Serverless Postgres)** e conecte ao projeto.
+   Isso cria o banco e a variável `DATABASE_URL` automaticamente.
+   (Se já tiver um banco no Neon, em vez disso vá em **Settings → Environment Variables** e crie
+   `DATABASE_URL` com a *connection string* do Neon.)
+4. Em **Deployments**, clique em **Redeploy** para a API enxergar a variável.
+5. Abra o endereço do app (ex.: `https://controledispensa.vercel.app`) no celular, crie a casa e envie o link de convite para a família.
 
-Os valores do `firebaseConfig` não são secretos; o que protege os dados são as regras do Firestore.
+As tabelas são criadas sozinhas na primeira vez. Só é possível criar **uma casa** por instalação (para ninguém
+usar o seu banco); se quiser várias, defina a variável `ALLOW_NEW_HOUSES=1` na Vercel.
 
-## Como rodar localmente
+### Tabelas no banco
 
-Não precisa de build. Sirva a pasta com qualquer servidor estático:
+| tabela        | conteúdo |
+|---------------|----------|
+| `houses`      | a casa e o *hash* da chave do link de convite |
+| `docs`        | produtos, grupos, movimentações (log), pessoas e preferências; uma linha por item, com os dados em `jsonb` (coluna `col` diz o tipo) |
+| `applied_ops` | controle para uma alteração reenviada não ser aplicada duas vezes |
 
-```bash
-npm start            # http://localhost:5173
+Exemplo de consulta no SQL Editor do Neon (consumo por produto no mês):
+
+```sql
+select data->>'productName' as produto, sum((data->>'qty')::int) as usado
+  from docs
+ where col = 'movements' and not deleted and data->>'type' = 'out'
+   and to_timestamp((data->>'at')::bigint / 1000) >= date_trunc('month', now())
+ group by 1 order by 2 desc;
 ```
 
-Para desenvolver sem mexer no projeto real, use os emuladores do Firebase (precisa de Java):
+## Rodar localmente
 
 ```bash
-npm run emulators    # Auth + Firestore com as regras, e o app em http://127.0.0.1:5000
+npm install
+DATABASE_URL="postgres://usuario:senha@host/banco" npm start    # http://localhost:5173
 ```
 
-Na tela de configuração do app, cole `{ apiKey: "demo", projectId: "demo-dispensa", authDomain: "localhost", appId: "demo" }`.
-Projetos com nome `demo-*` se conectam automaticamente aos emuladores.
+Funciona com a connection string do Neon ou com um Postgres local.
+A câmera do celular só funciona em HTTPS (ou em `localhost`).
 
 Leitura de código de barras: usa o `BarcodeDetector` nativo (Chrome/Android) e, onde não existe (iPhone, desktop), a biblioteca [ZXing](https://github.com/zxing-js/library) incluída em `vendor/` (Apache-2.0).
 
@@ -89,14 +100,16 @@ Testam a similaridade entre produtos, a lista de compras e o relatório mensal.
 index.html            página única
 css/style.css         estilos (claro/escuro, mobile first)
 js/app.js             telas e navegação
-js/db.js              dados na nuvem (Firebase Auth + Firestore), casa, convites, movimentações, backup
-js/firebase-config.js configuração do projeto Firebase
-js/local-db.js        banco local da versão anterior (usado só para migrar os dados para a nuvem)
-firestore.rules       regras de segurança do Firestore
-firebase.json         Firebase Hosting e emuladores
+js/db.js              dados: cópia local, fila offline e sincronização com a API
+js/local-db.js        banco local da versão anterior (usado só para migrar os dados)
+api/house.js          API: criar casa, link de convite, renomear
+api/sync.js           API: baixar o que mudou
+api/ops.js            API: gravar alterações (com proteção contra envio duplicado)
+api/_lib.js           conexão com o Postgres (Neon), tabelas e chave da casa
+server.js             servidor local (em produção a Vercel faz esse papel)
 js/similarity.js      agrupamento por similaridade e seção do mercado
 js/logic.js           lista de compras e relatório de consumo
 js/scanner.js         leitura do código de barras pela câmera
-sw.js                 cache offline
+sw.js                 cache offline do app
 vendor/zxing.min.js   leitor de código de barras para navegadores sem BarcodeDetector
 ```

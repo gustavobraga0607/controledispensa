@@ -138,13 +138,15 @@ const routes = [
   [/^\/relatorio$/, relatorio, 'Relatório de consumo', 'relatorio'],
   [/^\/mais$/, mais, 'Mais opções', 'home', true],
   [/^\/historico$/, historico, 'Histórico', 'home', true],
-  [/^\/nuvem$/, nuvem, 'Conectar à nuvem', 'home'],
-  [/^\/login$/, loginView, 'Entrar', 'home'],
-  [/^\/casa$/, casa, 'Casa e pessoas', 'home'],
+  [/^\/casa$/, casa, 'Casa e pessoas', 'home', true],
+  [/^\/convite$/, convite, 'Convite', 'home'],
+  [/^\/entrar$/, entrar, 'Quem está usando?', 'home'],
+  [/^\/pessoa\/([\w-]+)$/, pessoaForm, 'Pessoa', 'home', true],
 ];
 
-// Telas que funcionam antes de ter login/casa.
-const OPEN_ROUTES = /^\/(nuvem|login|casa)$/;
+// Telas que funcionam antes de abrir a casa / escolher a pessoa.
+const OPEN_ROUTES = /^\/(casa|convite)$/;
+const NO_PERSON_ROUTES = /^\/(casa|convite|entrar|pessoa\/novo)$/;
 // Telas que se atualizam sozinhas quando outra pessoa mexe nos dados.
 const LIVE_ROUTES = /^\/(|estoque|compras|relatorio|historico|grupos)$/;
 
@@ -160,12 +162,9 @@ async function router() {
   const raw = location.hash.slice(1) || '/';
   const [path, qs] = raw.split('?');
   const params = new URLSearchParams(qs || '');
-  // Antes de usar: projeto Firebase configurado, login feito e uma casa aberta.
-  if (!OPEN_ROUTES.test(path)) {
-    if (!db.isConfigured()) return go('#/nuvem');
-    if (!db.currentAuthUser()) return go('#/login');
-    if (!db.household()) return go('#/casa');
-  }
+  // Antes de usar: este aparelho precisa estar ligado a uma casa e saber quem está usando.
+  if (!OPEN_ROUTES.test(path) && !db.houseKey()) return go('#/casa');
+  if (!NO_PERSON_ROUTES.test(path) && db.houseKey() && !db.person()) return go(`#/entrar?next=${encodeURIComponent(raw)}`);
   currentPath = path;
   for (const [re, fn, title, tab, back] of routes) {
     const m = path.match(re);
@@ -244,8 +243,8 @@ async function home() {
     ${
       (await db.all('users')).length < 2
         ? `<div class="card"><b>👥 Chame a família</b>
-            <p class="small muted" style="margin:6px 0 10px">Envie o código de convite da casa para cada pessoa entrar pelo próprio celular. Tudo fica sincronizado e o histórico mostra quem retirou e quem guardou.</p>
-            <a class="btn sm primary" href="#/casa">Ver código de convite</a></div>`
+            <p class="small muted" style="margin:6px 0 10px">Envie o link de convite para cada pessoa abrir no próprio celular. Tudo fica sincronizado e o histórico mostra quem retirou e quem guardou.</p>
+            <a class="btn sm primary" href="#/casa">Enviar link de convite</a></div>`
         : ''
     }
     <p class="center" style="margin-top:18px"><a href="#/mais" class="btn sm">⚙️ Casa, grupos, histórico e backup</a></p>`;
@@ -1066,7 +1065,7 @@ async function mais() {
   const lookup = pref('lookupOnline', true);
   view.innerHTML = `
     <div class="card"><ul class="list">
-      <li><a class="item" href="#/casa"><div class="info"><b>🏡 ${esc(db.household()?.name || 'Casa')} e pessoas</b><span class="small muted">Código de convite, participantes e sua conta</span></div>›</a></li>
+      <li><a class="item" href="#/casa"><div class="info"><b>🏡 ${esc(db.household()?.name || 'Casa')} e pessoas</b><span class="small muted">Link de convite e pessoas</span></div>›</a></li>
       <li><a class="item" href="#/grupos"><div class="info"><b>🗂️ Grupos de produtos</b><span class="small muted">Similaridade, estoque mínimo e máximo</span></div>›</a></li>
       <li><a class="item" href="#/historico"><div class="info"><b>🕒 Histórico</b><span class="small muted">Quem retirou, quem guardou e outras ações</span></div>›</a></li>
     </ul></div>
@@ -1078,7 +1077,8 @@ async function mais() {
     </div>
     <h2>Backup</h2>
     <div class="card">
-      <p class="small muted">Os dados ficam na nuvem e sincronizam entre os celulares da casa. O backup gera uma cópia em arquivo, por segurança.</p>
+      <p class="small muted">Os dados ficam no banco de dados (Neon) e sincronizam entre os celulares da casa. O backup gera uma cópia em arquivo, por segurança.</p>
+      <p class="small" id="sync-status">${syncText()}</p>
       <div class="row wrap">
         <button class="btn" id="export">⬇️ Exportar backup</button>
         <label class="btn" for="import" style="margin:0;color:var(--text);font-size:1rem">⬆️ Restaurar backup</label>
@@ -1190,105 +1190,7 @@ async function clearLocalData() {
   await local.importAll({ ...data, groups: [], products: [], movements: [], users: [] });
 }
 
-// ----- Conectar ao Firebase -----
-async function nuvem() {
-  if (db.isConfigured()) return go('#/login');
-  view.innerHTML = `
-    <div class="card">
-      <b>☁️ Falta conectar o app ao seu projeto Firebase</b>
-      <p class="small muted" style="margin-top:6px">É gratuito e leva uns 5 minutos. O passo a passo completo está no README do projeto:</p>
-      <ol class="small" style="padding-left:18px">
-        <li>Crie um projeto em <a href="https://console.firebase.google.com" target="_blank" rel="noopener">console.firebase.google.com</a>.</li>
-        <li>Em <b>Authentication</b>, ative <b>E-mail/senha</b> (e <b>Google</b>, se quiser).</li>
-        <li>Em <b>Firestore Database</b>, crie o banco e cole as regras do arquivo <code>firestore.rules</code>.</li>
-        <li>Em <b>Configurações do projeto → Seus apps</b>, adicione um app da Web e copie o <code>firebaseConfig</code>.</li>
-      </ol>
-      <p class="small muted">Para não precisar colar em cada celular, coloque a configuração no arquivo <code>js/firebase-config.js</code>.</p>
-      <label for="cfg">Configuração (firebaseConfig)</label>
-      <textarea id="cfg" rows="8" placeholder="{ apiKey: '...', authDomain: '...', projectId: '...', ... }"></textarea>
-      <button class="btn primary block" id="save" style="margin-top:12px">Conectar</button>
-    </div>`;
-  $('#save').onclick = () => {
-    try {
-      db.saveConfig(db.parseConfig($('#cfg').value));
-      location.hash = '#/login';
-      location.reload();
-    } catch (err) {
-      toast(err.message);
-    }
-  };
-}
-
-// ----- Login -----
-async function loginView() {
-  if (!db.isConfigured()) return go('#/nuvem');
-  if (db.currentAuthUser()) return go(db.household() ? '#/' : '#/casa');
-  let mode = 'login';
-  const render = () => {
-    view.innerHTML = `
-      <div class="center" style="margin:10px 0 18px"><img src="icons/icon.svg" alt="" width="72" height="72"><h2 style="margin:8px 0 0">Dispensa</h2>
-        <p class="muted small">Estoque e compras da casa, sincronizados entre a família.</p></div>
-      <div class="segmented">
-        <a href="#" data-mode="login" class="${mode === 'login' ? 'active in' : ''}">Entrar</a>
-        <a href="#" data-mode="signup" class="${mode === 'signup' ? 'active in' : ''}">Criar conta</a>
-      </div>
-      <form id="f" class="card" autocomplete="on">
-        ${mode === 'signup' ? '<label for="name" style="margin-top:0">Seu nome</label><input id="name" required autocomplete="name" placeholder="Ex.: Ana">' : ''}
-        <label for="email" ${mode === 'login' ? 'style="margin-top:0"' : ''}>E-mail</label>
-        <input id="email" type="email" required autocomplete="email">
-        <label for="pass">Senha</label>
-        <input id="pass" type="password" required minlength="6" autocomplete="${mode === 'login' ? 'current-password' : 'new-password'}">
-        <button class="btn primary block" style="margin-top:14px" type="submit">${mode === 'login' ? 'Entrar' : 'Criar conta'}</button>
-        ${mode === 'login' ? '<button type="button" class="btn sm block" id="reset" style="margin-top:8px">Esqueci a senha</button>' : ''}
-      </form>
-      <button class="btn block" id="google">Entrar com Google</button>
-      ${db.configFromFile() ? '' : '<p class="center"><button class="btn sm" id="reconfig">Trocar projeto Firebase</button></p>'}`;
-  };
-  render();
-  const after = () => go('#/casa');
-  view.addEventListener('click', async (e) => {
-    const m = e.target.closest('[data-mode]');
-    if (m) {
-      e.preventDefault();
-      mode = m.dataset.mode;
-      render();
-      return;
-    }
-    try {
-      if (e.target.id === 'google') {
-        await db.loginGoogle();
-        after();
-      } else if (e.target.id === 'reset') {
-        const email = $('#email').value.trim();
-        if (!email) return toast('Digite seu e-mail acima');
-        await db.resetPassword(email);
-        toast('Enviamos um e-mail para redefinir a senha');
-      } else if (e.target.id === 'reconfig') {
-        if (!confirm('Desconectar deste projeto Firebase?')) return;
-        db.clearConfig();
-        location.hash = '#/nuvem';
-        location.reload();
-      }
-    } catch (err) {
-      toast(err.message);
-    }
-  });
-  view.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const btn = e.target.querySelector('[type=submit]');
-    btn.disabled = true;
-    try {
-      if (mode === 'login') await db.loginEmail($('#email').value.trim(), $('#pass').value);
-      else await db.signupEmail($('#name').value.trim(), $('#email').value.trim(), $('#pass').value);
-      after();
-    } catch (err) {
-      toast(err.message);
-      btn.disabled = false;
-    }
-  });
-}
-
-// ----- Casa: criar, entrar com código, convidar, perfil -----
+// ----- Casa: criar, convidar, pessoas -----
 const USER_ICONS = ['👩', '👨', '👧', '👦', '👵', '👴', '🧑', '👱', '🧔', '👩‍🦱', '🐶', '⭐'];
 
 function iconPicker(selected) {
@@ -1306,61 +1208,53 @@ function bindIconPicker(onPick) {
   );
 }
 
-async function casa({ params }) {
-  const user = db.currentAuthUser();
-  if (!db.isConfigured()) return go('#/nuvem');
-  if (!user) return go('#/login');
-  const house = db.household();
-  if (!house) return casaSetup(user, params);
+function syncText() {
+  const st = db.syncStatus();
+  if (st.offline) return `📴 Sem conexão${st.pending ? ` · ${st.pending} alteração(ões) esperando para enviar` : ''}`;
+  if (st.error) return `⚠️ ${esc(st.error)}`;
+  if (st.pending) return `⏳ Enviando ${st.pending} alteração(ões)…`;
+  return '✅ Tudo sincronizado';
+}
 
-  titleEl.textContent = house.name;
+async function casa() {
+  if (!db.houseKey()) return casaSetup();
+  const house = db.household();
+  titleEl.textContent = house?.name || 'Casa';
   const [members, movs] = await Promise.all([db.all('users'), db.all('movements')]);
-  const me = db.profile() || { name: user.displayName || '', icon: '🙂' };
-  let icon = me.icon;
+  const me = db.person();
+  const link = db.inviteLink();
   const count = (id) => movs.filter((m) => m.userId === id && m.type !== 'log').length;
-  const shareText = `Entre na nossa dispensa "${house.name}" no app Dispensa: ${location.origin}${location.pathname}\nCódigo de convite: ${house.inviteCode}`;
+  const shareText = `Abra este link para usar a dispensa "${house?.name || 'da casa'}" no app Dispensa:\n${link}`;
 
   view.innerHTML = `
-    <div class="card center">
-      <p class="muted small" style="margin:0">Código de convite</p>
-      <div class="invite-code">${esc(house.inviteCode || '—')}</div>
-      <p class="small muted">Cada pessoa cria a própria conta no app e digita este código em "Entrar numa casa".</p>
-      <div class="row wrap" style="justify-content:center">
+    <div class="card">
+      <b>🔗 Link de convite</b>
+      <p class="small muted" style="margin:6px 0 10px">Quem abrir este link no celular entra na casa, sem senha. Envie só para a família.</p>
+      <input id="link" readonly value="${esc(link)}">
+      <div class="row wrap" style="margin-top:10px">
         <button class="btn primary sm" id="share">📤 Enviar convite</button>
-        <button class="btn sm" id="new-code">🔄 Gerar outro código</button>
+        <button class="btn sm" id="copy">📋 Copiar</button>
       </div>
     </div>
     <h2>Pessoas (${members.length})</h2>
-    <div class="card"><ul class="list">${members
-      .sort(byName)
-      .map(
-        (m) => `<li class="item"><span class="thumb">${esc(m.icon || '🙂')}</span><div class="info"><b>${esc(m.name)}${m.id === user.uid ? ' <span class="badge">você</span>' : ''}</b>
-          <span class="small muted">${esc(m.email || '')} · ${count(m.id)} movimentação(ões)</span></div></li>`,
-      )
-      .join('')}</ul></div>
-    <h2>Seu perfil</h2>
-    <form id="profile" class="card">
-      <label for="pname" style="margin-top:0">Nome que aparece no histórico</label>
-      <input id="pname" required maxlength="30" value="${esc(me.name)}">
-      <label>Ícone</label>
-      ${iconPicker(icon)}
-      <button class="btn primary block" style="margin-top:14px" type="submit">Salvar perfil</button>
-    </form>
-    <details class="card"><summary>Configurações da casa</summary>
+    <div class="card"><ul class="list">${
+      members
+        .sort(byName)
+        .map(
+          (m) => `<li><a class="item" href="#/pessoa/${m.id}"><span class="thumb">${esc(m.icon || '🙂')}</span><div class="info"><b>${esc(m.name)}${me?.id === m.id ? ' <span class="badge">neste celular</span>' : ''}</b>
+          <span class="small muted">${count(m.id)} movimentação(ões)</span></div>›</a></li>`,
+        )
+        .join('') || '<li class="muted">Ninguém ainda.</li>'
+    }</ul></div>
+    <div class="row wrap"><a class="btn" href="#/pessoa/novo">＋ Adicionar pessoa</a><a class="btn" href="#/entrar">🔄 Trocar quem está usando</a></div>
+    <details class="card" style="margin-top:12px"><summary>Configurações da casa</summary>
       <label for="hname">Nome da casa</label>
-      <div class="input-btn"><input id="hname" value="${esc(house.name)}"><button class="btn" id="rename">Salvar</button></div>
-      <button class="btn danger block" id="leave" style="margin-top:14px">Sair desta casa</button>
-    </details>
-    <p class="small muted center">Conectado como ${esc(user.email || user.displayName || '')}</p>
-    <button class="btn block" id="logout">Sair da conta</button>`;
+      <div class="input-btn"><input id="hname" value="${esc(house?.name || '')}"><button class="btn" id="rename">Salvar</button></div>
+      <p class="small muted" style="margin-top:14px">Se o link foi parar com quem não devia, gere um novo. Os outros celulares da casa vão precisar abrir o link novo.</p>
+      <button class="btn block" id="rotate">🔐 Gerar novo link de convite</button>
+      <button class="btn danger block" id="forget" style="margin-top:8px">Desconectar este celular</button>
+    </details>`;
 
-  bindIconPicker((i) => (icon = i));
-  $('#profile').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const saved = await db.saveProfile({ name: $('#pname').value.trim(), icon });
-    updateUserChip();
-    toast(`Perfil salvo, ${saved.name}!`);
-  });
   $('#share').onclick = async () => {
     if (navigator.share) {
       try {
@@ -1371,138 +1265,182 @@ async function casa({ params }) {
     }
     window.open(`https://wa.me/?text=${encodeURIComponent(shareText)}`);
   };
-  $('#new-code').onclick = async () => {
-    if (!confirm('Gerar um novo código? O código atual deixa de funcionar (quem já entrou continua na casa).')) return;
+  $('#copy').onclick = async () => {
     try {
-      await db.newInviteCode();
-      navigate();
-    } catch (err) {
-      toast(err.code === 'unavailable' ? 'Precisa de internet para trocar o código' : err.message);
+      await navigator.clipboard.writeText(link);
+      toast('Link copiado');
+    } catch {
+      $('#link').select();
     }
   };
   $('#rename').onclick = async () => {
     const name = $('#hname').value.trim();
     if (!name) return;
-    await db.renameHousehold(name);
-    await db.log('house-rename', `renomeou a casa para ${name}`);
-    toast('Nome da casa salvo');
-    navigate();
-  };
-  $('#leave').onclick = async () => {
-    if (!confirm(`Sair da casa "${house.name}"? Você deixa de ver os dados dela até ser convidado de novo.`)) return;
     try {
-      await db.log('house-leave', 'saiu da casa');
-      await db.leaveHousehold();
-      updateUserChip();
-      go('#/casa');
+      await db.renameHouse(name);
+      await db.log('house-rename', `renomeou a casa para ${name}`);
+      toast('Nome da casa salvo');
+      navigate();
     } catch (err) {
       toast(err.message);
     }
   };
-  $('#logout').onclick = async () => {
-    await db.logout();
+  $('#rotate').onclick = async () => {
+    if (!confirm('Gerar um novo link? O link atual para de funcionar e os outros celulares precisarão abrir o novo.')) return;
+    try {
+      await db.rotateKey();
+      await db.log('house-rotate', 'gerou um novo link de convite');
+      toast('Novo link gerado. Envie para a família.');
+      navigate();
+    } catch (err) {
+      toast(err.message);
+    }
+  };
+  $('#forget').onclick = async () => {
+    if (!confirm('Desconectar este celular da casa? Os dados continuam salvos; para voltar, abra o link de convite.')) return;
+    await db.forgetHouse();
     updateUserChip();
-    go('#/login');
+    go('#/casa');
   };
 }
 
-// Primeira vez: criar uma casa nova ou entrar numa existente pelo código.
-async function casaSetup(user, params) {
-  titleEl.textContent = 'Sua casa';
-  view.innerHTML = '<p class="muted center">Carregando…</p>';
-  let houses = [];
+// Aparelho ainda sem casa: cria a casa (primeira vez) ou pede o link de convite.
+async function casaSetup() {
+  titleEl.textContent = 'Dispensa';
+  backBtn.hidden = true;
+  view.innerHTML = '<p class="muted center">Conectando…</p>';
+  let status;
   try {
-    houses = await db.myHouseholds();
+    status = await db.serverStatus();
   } catch (err) {
-    console.error(err);
+    view.innerHTML = `<div class="card"><b>Não foi possível falar com o servidor</b><p class="small muted">${esc(err.message)}</p><button class="btn" onclick="location.reload()">Tentar de novo</button></div>`;
+    return;
   }
-  // Já participa de exatamente uma casa: abre direto.
-  const last = db.lastHouseholdId();
-  const auto = houses.find((h) => h.id === last) || (houses.length === 1 ? houses[0] : null);
-  if (auto && !params.get('escolher')) {
-    await db.openHousehold(auto.id);
-    updateUserChip();
-    return go('#/');
-  }
-
-  let icon = USER_ICONS[0];
-  view.innerHTML = `
-    <p class="muted">Olá${user.displayName ? `, ${esc(user.displayName)}` : ''}! Os dados ficam numa <b>casa</b> compartilhada com a sua família.</p>
-    ${
-      houses.length
-        ? `<h2>Suas casas</h2><div class="card"><ul class="list">${houses
-            .map((h) => `<li><a class="item" href="#" data-open="${h.id}"><div class="info"><b>🏡 ${esc(h.name)}</b><span class="small muted">${h.members.length} pessoa(s)</span></div>›</a></li>`)
-            .join('')}</ul></div>`
-        : ''
-    }
-    <div class="card">
-      <label for="pname" style="margin-top:0">Seu nome (aparece no histórico)</label>
-      <input id="pname" maxlength="30" value="${esc(user.displayName || '')}" placeholder="Ex.: Ana">
-      <label>Seu ícone</label>
-      ${iconPicker(icon)}
-    </div>
-    <h2>Entrar numa casa</h2>
+  const pasteForm = `
     <form id="join" class="card">
-      <label for="code" style="margin-top:0">Código de convite</label>
-      <div class="input-btn"><input id="code" required autocapitalize="characters" maxlength="8" placeholder="Ex.: K7Q2MX" style="text-transform:uppercase;letter-spacing:.15em"><button class="btn primary">Entrar</button></div>
-      <p class="small muted" style="margin-top:6px">Peça o código para quem já usa o app (em ⚙️ → Casa e pessoas).</p>
-    </form>
-    <h2>Ou criar uma casa nova</h2>
-    <form id="create" class="card">
-      <label for="hname" style="margin-top:0">Nome da casa</label>
-      <div class="input-btn"><input id="hname" required value="Nossa casa"><button class="btn">Criar</button></div>
-    </form>
-    <p class="small muted center">Conectado como ${esc(user.email || '')} · <a href="#" id="logout">sair</a></p>`;
-
-  bindIconPicker((i) => (icon = i));
-  const profileData = () => ({ name: $('#pname').value.trim() || user.displayName || '', icon });
-  const run = async (btn, fn) => {
-    btn.disabled = true;
+      <label for="key" style="margin-top:0">Recebeu um link de convite? Abra o link ou cole aqui:</label>
+      <div class="input-btn"><input id="key" required placeholder="https://…#/convite?k=…" autocomplete="off"><button class="btn primary">Entrar</button></div>
+    </form>`;
+  view.innerHTML = `
+    <div class="center" style="margin:10px 0 18px"><img src="icons/icon.svg" alt="" width="72" height="72"><h2 style="margin:8px 0 0">Dispensa</h2>
+      <p class="muted small">Estoque e compras da casa, sincronizados entre a família.</p></div>
+    ${
+      status.exists
+        ? `<div class="card"><b>🏡 A casa já foi criada</b><p class="small muted" style="margin-top:6px">Peça o link de convite para quem já usa o app (⚙️ → Casa e pessoas → Enviar convite) e abra neste celular.</p></div>${pasteForm}`
+        : `<form id="create" class="card">
+            <b>Bem-vindo! Vamos criar a sua casa.</b>
+            <label for="hname">Nome da casa</label>
+            <input id="hname" required value="Nossa casa">
+            <button class="btn primary block" style="margin-top:14px">Criar casa</button>
+          </form>
+          <p class="small muted center">Depois é só enviar o link de convite para a família.</p>`
+    }`;
+  $('#create')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    e.target.querySelector('button').disabled = true;
     try {
-      await fn();
-      updateUserChip();
-      go('#/');
+      await db.createHouse($('#hname').value.trim());
+      toast('Casa criada!');
+      go('#/pessoa/novo?primeira=1');
     } catch (err) {
-      console.error(err);
       toast(err.message);
-      btn.disabled = false;
-    }
-  };
-  view.addEventListener('click', async (e) => {
-    const open = e.target.closest('[data-open]');
-    if (open) {
-      e.preventDefault();
-      await run(open, () => db.openHousehold(open.dataset.open));
-    }
-    if (e.target.id === 'logout') {
-      e.preventDefault();
-      await db.logout();
-      go('#/login');
+      e.target.querySelector('button').disabled = false;
     }
   });
-  $('#join').addEventListener('submit', (e) => {
+  $('#join')?.addEventListener('submit', async (e) => {
     e.preventDefault();
-    run(e.submitter || e.target.querySelector('button'), async () => {
-      await db.joinHousehold($('#code').value, profileData());
-      await db.log('house-join', 'entrou na casa');
-    });
+    try {
+      await db.joinWithKey($('#key').value);
+      go('#/entrar');
+    } catch (err) {
+      toast(err.message);
+    }
   });
-  $('#create').addEventListener('submit', (e) => {
+}
+
+// Link de convite aberto: #/convite?k=CHAVE
+async function convite({ params }) {
+  view.innerHTML = '<p class="muted center">Entrando na casa…</p>';
+  try {
+    const h = await db.joinWithKey(params.get('k'));
+    toast(`Bem-vindo à ${h.name}!`);
+    history.replaceState(null, '', '#/entrar');
+    navigate();
+  } catch (err) {
+    view.innerHTML = `<div class="card"><b>Não foi possível usar este convite</b><p class="small muted">${esc(err.message)}</p><a class="btn" href="#/casa">Voltar</a></div>`;
+  }
+}
+
+// Quem está usando este celular (sem senha).
+async function entrar({ params }) {
+  const users = (await db.all('users')).sort(byName);
+  const next = params.get('next') || '/';
+  if (!users.length) return go('#/pessoa/novo');
+  const me = db.person();
+  view.innerHTML = `
+    <p class="muted">Quem está usando este celular? Tudo o que for retirado ou guardado fica registrado com esse nome.</p>
+    <div class="user-grid">${users
+      .map((u) => `<button class="user-card ${me?.id === u.id ? 'active' : ''}" data-id="${u.id}"><span>${esc(u.icon || '🙂')}</span><b>${esc(u.name)}</b></button>`)
+      .join('')}
+      <a class="user-card" href="#/pessoa/novo"><span>＋</span><b>Sou novo aqui</b></a></div>`;
+  view.querySelector('.user-grid').addEventListener('click', (e) => {
+    const card = e.target.closest('[data-id]');
+    if (!card) return;
+    const u = users.find((x) => x.id === card.dataset.id);
+    db.setPerson(u.id);
+    updateUserChip();
+    toast(`Olá, ${u.name}!`);
+    go(`#${next}`);
+  });
+}
+
+async function pessoaForm({ args, params }) {
+  const isNew = args[0] === 'novo';
+  const users = await db.all('users');
+  const u = isNew ? { id: db.uid(), name: '', icon: USER_ICONS[users.length % USER_ICONS.length] } : users.find((x) => x.id === args[0]);
+  if (!u) throw new Error('Pessoa não encontrada');
+  titleEl.textContent = isNew ? (params.get('primeira') ? 'Quem é você?' : 'Nova pessoa') : u.name;
+  backBtn.hidden = !db.person();
+  let icon = u.icon;
+  view.innerHTML = `
+    <form id="f" class="card" autocomplete="off">
+      <label for="name" style="margin-top:0">Nome</label>
+      <input id="name" required maxlength="30" value="${esc(u.name)}" placeholder="Ex.: Ana">
+      <label>Ícone</label>
+      ${iconPicker(icon)}
+      ${isNew && db.person() ? '<label class="row" style="color:var(--text)"><input type="checkbox" id="use" style="width:20px;min-height:0"> Usar este celular como essa pessoa</label>' : ''}
+      <button class="btn primary block" style="margin-top:16px" type="submit">Salvar</button>
+    </form>
+    ${isNew ? '' : '<button class="btn danger block" id="del">Remover pessoa</button><p class="small muted center">O histórico dessa pessoa continua guardado.</p>'}`;
+  bindIconPicker((i) => (icon = i));
+  $('#f').addEventListener('submit', async (e) => {
     e.preventDefault();
-    run(e.submitter || e.target.querySelector('button'), async () => {
-      await db.createHousehold($('#hname').value.trim() || 'Nossa casa', profileData());
-      await db.log('house-create', `criou a casa ${$('#hname').value.trim()}`);
-    });
+    const name = $('#name').value.trim();
+    if (users.some((x) => x.id !== u.id && x.name.toLowerCase() === name.toLowerCase())) return toast('Já existe alguém com esse nome');
+    const saved = await db.put('users', { ...u, name, icon, createdAt: u.createdAt || Date.now() });
+    if (!db.person() || $('#use')?.checked) db.setPerson(saved.id);
+    await db.log(isNew ? 'user-create' : 'user-edit', `${isNew ? 'cadastrou' : 'editou'} a pessoa ${saved.name}`);
+    updateUserChip();
+    toast(isNew ? `${saved.name} cadastrado(a)` : 'Salvo');
+    go(params.get('primeira') ? '#/' : isNew && !$('#use') ? '#/' : '#/casa');
+  });
+  $('#del')?.addEventListener('click', async () => {
+    if (!confirm(`Remover ${u.name}? O histórico continua mostrando o nome.`)) return;
+    await db.remove('users', u.id);
+    await db.log('user-delete', `removeu a pessoa ${u.name}`);
+    if (db.person() === null) db.setPerson(null);
+    updateUserChip();
+    go('#/casa');
   });
 }
 
 function updateUserChip() {
   const btn = document.getElementById('user-btn');
-  const me = db.household() ? db.profile() : null;
+  const me = db.houseKey() ? db.person() : null;
   btn.hidden = !me;
   if (me) {
     btn.textContent = `${me.icon || '🙂'} ${me.name}`;
-    btn.title = 'Casa e perfil';
+    btn.title = 'Trocar quem está usando';
   }
 }
 
@@ -1517,11 +1455,13 @@ let liveTimer = null;
 db.onChange((evt) => {
   if (evt.type === 'auth') {
     updateUserChip();
-    navigate();
-  } else if (evt.type === 'error') {
-    toast(evt.error?.code === 'permission-denied' ? 'Sem permissão para salvar. Você ainda faz parte da casa?' : 'Erro ao sincronizar com a nuvem');
+    toast(evt.error?.message || 'Este celular foi desconectado da casa');
+    go('#/casa');
+  } else if (evt.type === 'status') {
+    const el = document.getElementById('sync-status');
+    if (el) el.innerHTML = syncText();
   } else if (evt.type === 'remote') {
-    if (evt.collection === 'users') updateUserChip();
+    updateUserChip();
     // Outra pessoa mexeu: atualiza a tela atual se ela só mostra dados.
     clearTimeout(liveTimer);
     liveTimer = setTimeout(() => {
@@ -1533,12 +1473,9 @@ db.onChange((evt) => {
 (async () => {
   view.innerHTML = '<p class="muted center" style="margin-top:40px">Carregando…</p>';
   try {
-    const user = await db.init();
-    const last = db.lastHouseholdId();
-    if (user && last) await db.openHousehold(last).catch((err) => console.warn(err));
+    await db.init();
   } catch (err) {
     console.error(err);
-    toast('Não foi possível conectar à nuvem');
   }
   updateUserChip();
   navigate();
