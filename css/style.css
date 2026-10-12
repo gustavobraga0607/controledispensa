@@ -244,3 +244,6 @@ details summary { cursor: pointer; font-weight: 600; padding: 6px 0; }
   background: var(--card); cursor: pointer;
 }
 .icon-pick button.active { border-color: var(--primary); background: var(--primary-soft); }
+
+.invite-code { font: 700 2rem/1.2 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: 0.2em; margin: 6px 0 10px; color: var(--primary); }
+textarea { font-family: ui-monospace, Menlo, monospace; font-size: 0.85rem; }

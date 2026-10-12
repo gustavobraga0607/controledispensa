@@ -1,7 +1,7 @@
 // Regras de negócio puras (sem DOM nem IndexedDB) para facilitar os testes.
 
 export function groupStock(groupId, products) {
-  return products.filter((p) => p.groupId === groupId).reduce((sum, p) => sum + (Number(p.qty) || 0), 0);
+  return products.filter((p) => p.groupId === groupId).reduce((sum, p) => sum + Math.max(0, Number(p.qty) || 0), 0);
 }
 
 // Situação do grupo em relação ao estoque mínimo/máximo.
